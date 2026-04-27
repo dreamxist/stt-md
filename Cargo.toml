@@ -1,0 +1,49 @@
+[package]
+name = "stt-md"
+version = "0.1.0"
+edition = "2024"
+description = "Lightweight macOS menubar app: mic → whisper → Ollama summary → Obsidian vault"
+license = "MIT"
+repository = "https://github.com/dreamxist/stt-md"
+readme = "README.md"
+keywords = ["macos", "menubar", "whisper", "transcription", "obsidian"]
+categories = ["multimedia::audio"]
+publish = false
+
+[lib]
+name = "stt_md"
+path = "src/lib.rs"
+
+[[bin]]
+name = "stt-md"
+path = "src/main.rs"
+
+[[bin]]
+name = "transcribe-wav"
+path = "src/bin/transcribe-wav.rs"
+
+[dependencies]
+tao = "0.30"
+tray-icon = "0.19"
+cpal = "0.15"
+hound = "3.5"
+whisper-rs = { version = "0.16", features = ["metal"] }
+rubato = "0.15"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2"
+notify-rust = "4"
+toml = "0.8"
+anyhow = "1"
+thiserror = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+codegen-units = 1
