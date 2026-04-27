@@ -22,6 +22,8 @@
     <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>stt-md captura tu micrófono para transcribir reuniones localmente.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>stt-md captura el audio del sistema (Zoom/Meet/Teams) para transcribir reuniones remotas. Todo el audio se procesa localmente; nada sale de tu máquina.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>

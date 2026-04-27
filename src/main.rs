@@ -101,8 +101,8 @@ fn main() -> anyhow::Result<()> {
             } else if event.id == start_id {
                 let mut st = state.lock();
                 if matches!(*st, AppState::Idle) {
-                    match RecordingSession::start() {
-                        Ok(s) => {
+                    match RecordingSession::start_with_fallback() {
+                        Ok((s, used_system)) => {
                             sounds::play_start();
                             let started_at = s.started_at;
                             let now = Local::now();
@@ -111,11 +111,19 @@ fn main() -> anyhow::Result<()> {
                             start_item.set_enabled(false);
                             stop_item.set_enabled(true);
                             stop_item.set_text("Detener — 00:00");
+                            let label = if used_system {
+                                "● grabando (mic + sistema)"
+                            } else {
+                                "● grabando (solo mic)"
+                            };
                             if let Some(t) = tray.as_ref() {
                                 let _ = t.set_title(Some(" 00:00".to_string()));
-                                let _ = t.set_tooltip(Some("● grabando 00:00".to_string()));
+                                let _ = t.set_tooltip(Some(format!("{label} 00:00")));
                             }
-                            println!("[stt-md] recording started");
+                            println!(
+                                "[stt-md] recording started (system audio: {})",
+                                if used_system { "yes" } else { "no — fallback to mic-only" }
+                            );
                         }
                         Err(e) => eprintln!("[stt-md] failed to start recording: {e:?}"),
                     }
