@@ -27,6 +27,7 @@ tao = "0.30"
 tray-icon = "0.19"
 cpal = "0.15"
 hound = "3.5"
+screencapturekit = { version = "1.5", features = ["macos_13_0"] }
 whisper-rs = { version = "0.16", features = ["metal"] }
 rubato = "0.15"
 chrono = { version = "0.4", features = ["serde"] }
