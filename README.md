@@ -4,7 +4,7 @@
 
 **Record. Transcribe. Summarize. All local. Straight to Obsidian.**
 
-A 3 MB macOS menubar app that turns your meetings into structured Markdown notes — using local Whisper for speech-to-text and a local LLM for summaries — without ever sending audio to the cloud.
+A 3 MB macOS menubar app that turns your meetings into structured Markdown notes — using local Whisper for speech-to-text and a local LLM for summaries — without ever sending audio to the cloud. Works with any Markdown editor; has a deeper integration mode for Obsidian.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.77+-orange?logo=rust&logoColor=white)](https://www.rust-lang.org)
@@ -115,17 +115,46 @@ osascript -e 'tell application "System Events" to delete login item "stt-md"'
 
 ## Configuration
 
-On first launch, `~/Library/Application Support/stt-md/config.toml` is created with sensible defaults:
+On first launch, `~/Library/Application Support/stt-md/config.toml` is created. Two output modes:
+
+### `simple` mode (default for new installs)
+
+Plain Markdown. Just dumps the summary `.md` to a flat folder. **No Obsidian required** — works with any Markdown editor (VS Code, Bear, Logseq, Notion-import, Apple Notes 16+, GitHub gists, …).
 
 ```toml
-vault_root = "/Users/<you>/path/to/your-vault"
+output_mode = "simple"
+output_dir = "/Users/<you>/Documents/stt-md-notes"
+
 ollama_model = "qwen2.5:7b"
 ollama_url = "http://localhost:11434"
 whisper_language = "es"
 whisper_model_filename = "ggml-large-v3-turbo.bin"
 ```
 
-Edit it to match your setup. The vault is scanned every time you stop a recording, so changes take effect immediately.
+In simple mode the LLM picks tags freely (max 4, lowercase kebab-case) and there's no daily-note coupling. Output looks like:
+
+```
+~/Documents/stt-md-notes/
+├── 2026-04-27-1430-team-standup.md
+├── 2026-04-27-1605-1on1-juan.md
+└── 2026-04-28-0930-planning.md
+```
+
+### `obsidian` mode
+
+Full vault integration: scans your vault for tags + wikilinks, writes to `<vault>/2-calendar/YYYY/MM/meetings/`, and appends a wikilink to today's daily under `## 🤖 Agent Log`.
+
+```toml
+output_mode = "obsidian"
+vault_root = "/Users/<you>/path/to/your-vault"
+
+ollama_model = "qwen2.5:7b"
+ollama_url = "http://localhost:11434"
+whisper_language = "es"
+whisper_model_filename = "ggml-large-v3-turbo.bin"
+```
+
+The vault is scanned every time you stop a recording. Hallucinated tags / wikilinks (anything not actually present in the vault) are filtered out post-hoc — the vault is the source of truth, the LLM is treated as untrusted input.
 
 ## Usage
 
@@ -222,9 +251,10 @@ src/
 │   ├── prompts.rs       # structured-summary prompt with vault vocabulary
 │   └── mod.rs           # MeetingSummary + enforce_vocab()
 ├── vault/
-│   ├── scanner.rs       # walkdir → tags + wikilink targets
-│   ├── meeting_writer.rs# generate the meeting .md
-│   └── daily_appender.rs# append link to ## 🤖 Agent Log
+│   ├── scanner.rs       # walkdir → tags + wikilink targets (obsidian mode)
+│   ├── meeting_writer.rs# generate the .md (obsidian mode)
+│   ├── daily_appender.rs# append link to ## 🤖 Agent Log (obsidian mode)
+│   └── simple_writer.rs # plain-markdown output (simple mode)
 └── bin/
     ├── transcribe-wav.rs # CLI: WAV → bare-transcript .md (no LLM)
     ├── test-summary.rs   # CLI: prompt + Ollama dry run (set STT_MD_VAULT)

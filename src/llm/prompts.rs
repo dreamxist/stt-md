@@ -2,6 +2,8 @@ use chrono::Local;
 
 use crate::vault::scanner::VaultVocabulary;
 
+const MAX_FREE_TAGS: usize = 4;
+
 const MAX_TAGS_IN_PROMPT: usize = 150;
 const MAX_WIKILINKS_IN_PROMPT: usize = 100;
 
@@ -81,6 +83,51 @@ JSON:"#,
         today_short = today.format("%Y-%m-%d"),
         tags_str = tags_str,
         wikilinks_str = wikilinks_str,
+        transcript = transcript,
+    )
+}
+
+/// Prompt for `output_mode = "simple"` — no vault, no closed vocabulary.
+/// LLM picks up to MAX_FREE_TAGS tags freely (lowercase kebab-case).
+pub fn build_simple_summary_prompt(transcript: &str) -> String {
+    let today = Local::now();
+    let today_str = today.format("%Y-%m-%d (%A)").to_string();
+    let today_short = today.format("%Y-%m-%d").to_string();
+
+    format!(
+        r#"Eres un asistente que resume reuniones en español chileno neutro.
+Hoy es {today_str}.
+
+REGLAS DURAS:
+1. Responde EXCLUSIVAMENTE con JSON válido. Sin explicaciones, sin markdown fences.
+2. "deadline": fechas relativas usando hoy = {today_short}. "Jueves próximo" = primer jueves estrictamente después de hoy. Si no hay deadline explícito, usa null. Solo formato YYYY-MM-DD.
+3. "decisions" = acuerdos tomados sobre qué se va a hacer (sin quién). "action_items" = quién hace qué con deadline opcional. NO dupliques entre decisions y action_items.
+4. Nombres en kebab-case lowercase sin apellido: "Juan Pérez" → "juan", "María González" → "maria".
+5. NUNCA inventes personas. Si no se mencionan nombres propios explícitamente, devuelve people = [].
+6. "tags": máximo {max_tags} tags en kebab-case lowercase, descriptivos del contenido (ej: "standup", "planning", "retro", "1on1"). Sin tildes ni símbolos.
+7. project_wikilink: siempre null en este modo.
+8. Si la transcripción es solo una nota rápida o saludo (sin reunión real), title puede ser "Nota rápida", listas vacías.
+
+SCHEMA EXACTO:
+{{
+  "title": "string corto sin fecha",
+  "summary_md": "markdown con 4-7 bullets sobre lo principal",
+  "decisions": ["frases cortas"],
+  "action_items": [
+    {{ "who": "kebab-case o null", "task": "string", "deadline": "YYYY-MM-DD o null" }}
+  ],
+  "people": ["kebab-case lowercase"],
+  "tags": ["máximo {max_tags} tags kebab-case"],
+  "project_wikilink": null
+}}
+
+TRANSCRIPCIÓN A RESUMIR:
+{transcript}
+
+JSON:"#,
+        today_str = today_str,
+        today_short = today_short,
+        max_tags = MAX_FREE_TAGS,
         transcript = transcript,
     )
 }

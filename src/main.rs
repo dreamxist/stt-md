@@ -15,7 +15,7 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
 
 use app_state::AppState;
-use config::Config;
+use config::{Config, OutputMode};
 use recording::RecordingSession;
 use transcription::whisper::WhisperEngine;
 
@@ -27,7 +27,10 @@ enum ProcessingMsg {
 fn main() -> anyhow::Result<()> {
     let cfg = Config::load_or_init()?;
     println!("[stt-md] config loaded from {}", Config::config_path().display());
-    println!("[stt-md] vault: {}", cfg.vault_root.display());
+    match cfg.output_mode {
+        OutputMode::Obsidian => println!("[stt-md] mode: obsidian → {}", cfg.vault_root.display()),
+        OutputMode::Simple => println!("[stt-md] mode: simple   → {}", cfg.output_dir.display()),
+    }
     let cfg = Arc::new(cfg);
 
     let event_loop = EventLoop::new();
@@ -255,6 +258,43 @@ fn process_recording(
         t0.elapsed().as_millis()
     );
 
+    let transcript_text: String = segments
+        .iter()
+        .map(|s| {
+            let mins = s.start_ms / 60_000;
+            let secs = (s.start_ms % 60_000) / 1000;
+            format!("[{:02}:{:02}] {}\n", mins, secs, s.text)
+        })
+        .collect();
+
+    match cfg.output_mode {
+        OutputMode::Obsidian => process_obsidian_mode(
+            cfg,
+            wav_path,
+            started_at_local,
+            duration_min,
+            &segments,
+            &transcript_text,
+        ),
+        OutputMode::Simple => process_simple_mode(
+            cfg,
+            wav_path,
+            started_at_local,
+            duration_min,
+            &segments,
+            &transcript_text,
+        ),
+    }
+}
+
+fn process_obsidian_mode(
+    cfg: &Config,
+    wav_path: &std::path::Path,
+    started_at_local: DateTime<Local>,
+    duration_min: i64,
+    segments: &[transcription::TranscriptSegment],
+    transcript_text: &str,
+) -> anyhow::Result<PathBuf> {
     let vault_root = cfg.vault_root.as_path();
 
     let t0 = Instant::now();
@@ -266,18 +306,12 @@ fn process_recording(
         vocab.wikilink_targets.len()
     );
 
-    let transcript_text: String = segments
-        .iter()
-        .map(|s| {
-            let mins = s.start_ms / 60_000;
-            let secs = (s.start_ms % 60_000) / 1000;
-            format!("[{:02}:{:02}] {}\n", mins, secs, s.text)
-        })
-        .collect();
+    let prompt = llm::prompts::build_summary_prompt(transcript_text, &vocab);
 
-    let prompt = llm::prompts::build_summary_prompt(&transcript_text, &vocab);
-
-    println!("[stt-md] calling Ollama ({}) — this can take 20-60s…", cfg.ollama_model);
+    println!(
+        "[stt-md] calling Ollama ({}) — this can take 20-60s…",
+        cfg.ollama_model
+    );
     let t0 = Instant::now();
     let raw = llm::ollama::generate_json(&prompt, &cfg.ollama_model, &cfg.ollama_url)?;
     println!("[stt-md] ollama replied in {}ms", t0.elapsed().as_millis());
@@ -290,7 +324,7 @@ fn process_recording(
         vault_root,
         started_at_local,
         &summary,
-        &segments,
+        segments,
         duration_min,
         wav_path,
     )?;
@@ -306,6 +340,41 @@ fn process_recording(
     println!("[stt-md] updated daily {}", daily_path.display());
 
     Ok(written.absolute_path)
+}
+
+fn process_simple_mode(
+    cfg: &Config,
+    wav_path: &std::path::Path,
+    started_at_local: DateTime<Local>,
+    duration_min: i64,
+    segments: &[transcription::TranscriptSegment],
+    transcript_text: &str,
+) -> anyhow::Result<PathBuf> {
+    let prompt = llm::prompts::build_simple_summary_prompt(transcript_text);
+
+    println!(
+        "[stt-md] calling Ollama ({}) — simple mode…",
+        cfg.ollama_model
+    );
+    let t0 = Instant::now();
+    let raw = llm::ollama::generate_json(&prompt, &cfg.ollama_model, &cfg.ollama_url)?;
+    println!("[stt-md] ollama replied in {}ms", t0.elapsed().as_millis());
+
+    let mut summary: llm::MeetingSummary = serde_json::from_str(&raw)
+        .map_err(|e| anyhow::anyhow!("ollama returned invalid JSON: {e}\n--- raw ---\n{raw}"))?;
+    summary.normalize_simple(4);
+
+    let path = vault::simple_writer::write_simple(
+        cfg.output_dir.as_path(),
+        started_at_local,
+        &summary,
+        segments,
+        duration_min,
+        wav_path,
+    )?;
+    println!("[stt-md] wrote {}", path.display());
+
+    Ok(path)
 }
 
 fn build_idle_icon() -> Icon {

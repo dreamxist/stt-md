@@ -4,20 +4,52 @@ use std::path::{Path, PathBuf};
 
 use crate::paths;
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputMode {
+    /// Obsidian-flavored: scans vault for tags + wikilinks, writes to
+    /// `<vault>/2-calendar/YYYY/MM/meetings/`, appends link to today's daily.
+    #[default]
+    Obsidian,
+    /// Plain-Markdown mode: no vault scan, no wikilinks, no daily appender.
+    /// Just dumps the summary `.md` into `output_dir`.
+    Simple,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub output_mode: OutputMode,
+
+    /// Used when `output_mode = "obsidian"`. Root of the Obsidian vault.
     pub vault_root: PathBuf,
+
+    /// Used when `output_mode = "simple"`. Flat directory where `.md` files land.
+    #[serde(default = "default_output_dir")]
+    pub output_dir: PathBuf,
+
     pub ollama_model: String,
     pub ollama_url: String,
     pub whisper_language: String,
     pub whisper_model_filename: String,
 }
 
+fn default_output_dir() -> PathBuf {
+    dirs::document_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("stt-md-notes")
+}
+
 impl Default for Config {
     fn default() -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
         Self {
-            vault_root: home.join("home").join("brain"),
+            // New installs default to `simple` so the app works without Obsidian.
+            // Existing config files without an `output_mode` field fall back to
+            // `obsidian` via OutputMode::default() (backward-compat).
+            output_mode: OutputMode::Simple,
+            vault_root: home.join("Documents").join("Obsidian").join("vault"),
+            output_dir: default_output_dir(),
             ollama_model: "qwen2.5:7b".to_string(),
             ollama_url: "http://localhost:11434".to_string(),
             whisper_language: "es".to_string(),
