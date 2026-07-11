@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- stt-md app icon: waveform turning into markdown lines, monoline, rec dot -->
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#152044"/>
+      <stop offset="1" stop-color="#05070f"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#bg)"/>
+  <g stroke="#e8ecff" stroke-width="46" stroke-linecap="round" fill="none">
+    <path d="M 250 432 V 592"/>
+    <path d="M 338 332 V 692"/>
+    <path d="M 426 456 V 568"/>
+    <path d="M 528 388 h 6"/>
+    <path d="M 600 388 h 176"/>
+    <path d="M 528 512 h 248"/>
+    <path d="M 528 636 h 146"/>
+  </g>
+  <circle cx="790" cy="292" r="42" fill="#ff5d73"/>
+</svg>
