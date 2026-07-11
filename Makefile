@@ -14,11 +14,12 @@ check:
 
 build: $(APP_BUNDLE)
 
-$(APP_BUNDLE): $(TARGET_DIR)/$(BIN_NAME) Info.plist
+$(APP_BUNDLE): $(TARGET_DIR)/$(BIN_NAME) Info.plist assets/AppIcon.icns
 	@mkdir -p $(APP_BUNDLE)/Contents/MacOS
 	@mkdir -p $(APP_BUNDLE)/Contents/Resources
 	@cp $(TARGET_DIR)/$(BIN_NAME) $(APP_BUNDLE)/Contents/MacOS/$(BIN_NAME)
 	@cp Info.plist $(APP_BUNDLE)/Contents/Info.plist
+	@cp assets/AppIcon.icns $(APP_BUNDLE)/Contents/Resources/AppIcon.icns
 	@touch $(APP_BUNDLE)
 	@echo "Built $(APP_BUNDLE)"
 
