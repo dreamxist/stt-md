@@ -36,8 +36,8 @@ pub fn load_wav_mono_f32(path: &Path) -> Result<(Vec<f32>, u32)> {
     Ok((mono, sample_rate))
 }
 
-/// Linear interpolation resample to 16kHz. Adequate for speech band; for higher
-/// fidelity (or 48k → 16k without aliasing) swap for rubato in a later phase.
+/// Linear interpolation resample to 16kHz. Adequate for the speech band that
+/// Whisper consumes; a windowed-sinc resampler would only matter for music.
 pub fn resample_to_16k(samples: &[f32], from_rate: u32) -> Vec<f32> {
     if from_rate == 16_000 {
         return samples.to_vec();
@@ -56,4 +56,30 @@ pub fn resample_to_16k(samples: &[f32], from_rate: u32) -> Vec<f32> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resample_identity_at_16k() {
+        let s = vec![0.1, 0.2, 0.3];
+        assert_eq!(resample_to_16k(&s, 16_000), s);
+    }
+
+    #[test]
+    fn resample_halves_48k_to_16k() {
+        let s: Vec<f32> = (0..48_000).map(|i| (i as f32).sin()).collect();
+        let out = resample_to_16k(&s, 48_000);
+        let expected = 16_000;
+        assert!((out.len() as i64 - expected).abs() <= 2, "len={}", out.len());
+    }
+
+    #[test]
+    fn resample_preserves_constant_signal() {
+        let s = vec![0.5f32; 44_100];
+        let out = resample_to_16k(&s, 44_100);
+        assert!(out.iter().all(|v| (v - 0.5).abs() < 1e-6));
+    }
 }

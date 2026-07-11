@@ -7,7 +7,7 @@ const MAX_FREE_TAGS: usize = 4;
 const MAX_TAGS_IN_PROMPT: usize = 150;
 const MAX_WIKILINKS_IN_PROMPT: usize = 100;
 
-pub fn build_summary_prompt(transcript: &str, vocab: &VaultVocabulary) -> String {
+pub fn build_summary_prompt(transcript: &str, vocab: &VaultVocabulary, areas: &[String]) -> String {
     let mut all_tags: Vec<String> = vocab.all_tags();
     all_tags.sort();
     all_tags.dedup();
@@ -30,6 +30,25 @@ pub fn build_summary_prompt(transcript: &str, vocab: &VaultVocabulary) -> String
     let today = Local::now();
     let today_str = today.format("%Y-%m-%d (%A)").to_string();
 
+    let (areas_block, area_schema, area_rule, area_example) = if areas.is_empty() {
+        (
+            String::new(),
+            "null".to_string(),
+            "8. \"area\": siempre null.".to_string(),
+            "null".to_string(),
+        )
+    } else {
+        (
+            format!(
+                "\nÁREAS DEL VAULT (lista cerrada — elige la que mejor describe la reunión):\n{}\n",
+                areas.join(", ")
+            ),
+            "\"una de la lista de áreas o null\"".to_string(),
+            "8. \"area\": elige EXACTAMENTE un valor de la lista de áreas (el más específico que aplique). Si ninguna calza claramente, usa null.".to_string(),
+            format!("\"{}\"", areas[0]),
+        )
+    };
+
     format!(
         r#"Eres un asistente que resume reuniones para un vault de Obsidian en español chileno.
 Hoy es {today_str}.
@@ -39,6 +58,7 @@ VOCABULARIO DE TAGS PERMITIDOS (lista cerrada — NO existe ningún tag fuera de
 
 WIKILINKS POSIBLES (nombres de archivos del vault — proyectos, personas, conceptos):
 {wikilinks_str}
+{areas_block}
 
 REGLAS DURAS:
 1. Responde EXCLUSIVAMENTE con JSON válido. Sin explicaciones, sin markdown fences.
@@ -48,6 +68,7 @@ REGLAS DURAS:
 5. Nombres en kebab-case lowercase sin apellido: "Juan Pérez" → "juan", "María González" → "maria".
 6. NUNCA inventes personas. Si la transcripción NO menciona nombres propios explícitamente, devuelve people = []. Mejor lista vacía que nombres alucinados.
 7. Si la transcripción es solo un monólogo de prueba o saludo (sin reunión real), title puede ser "Nota rápida", summary breve, decisions/action_items/people vacíos.
+{area_rule}
 
 SCHEMA EXACTO:
 {{
@@ -59,7 +80,8 @@ SCHEMA EXACTO:
   ],
   "people": ["kebab-case lowercase"],
   "tags": ["solo del vocabulario"],
-  "project_wikilink": "[[nombre]] o null"
+  "project_wikilink": "[[nombre]] o null",
+  "area": {area_schema}
 }}
 
 EJEMPLO de buena respuesta:
@@ -72,7 +94,8 @@ EJEMPLO de buena respuesta:
   ],
   "people": ["ana", "luis"],
   "tags": ["proyecto-x", "roadmap"],
-  "project_wikilink": "[[proyecto-x]]"
+  "project_wikilink": "[[proyecto-x]]",
+  "area": {area_example}
 }}
 
 TRANSCRIPCIÓN A RESUMIR:

@@ -1,6 +1,6 @@
 [package]
 name = "stt-md"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Lightweight macOS menubar app: mic → whisper → Ollama summary → Obsidian vault"
 license = "MIT"
@@ -25,11 +25,11 @@ path = "src/bin/transcribe-wav.rs"
 [dependencies]
 tao = "0.30"
 tray-icon = "0.19"
+png = "0.17"
 cpal = "0.15"
 hound = "3.5"
 screencapturekit = { version = "1.5", features = ["macos_13_0"] }
 whisper-rs = { version = "0.16", features = ["metal"] }
-rubato = "0.15"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
 parking_lot = "0.12"
@@ -41,7 +41,6 @@ walkdir = "2"
 notify-rust = "4"
 toml = "0.8"
 anyhow = "1"
-thiserror = "1"
 
 [profile.release]
 opt-level = 3

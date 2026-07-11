@@ -7,7 +7,7 @@
 A 3 MB macOS menubar app that turns your meetings into structured Markdown notes — using local Whisper for speech-to-text and a local LLM for summaries — without ever sending audio to the cloud. Works with any Markdown editor; has a deeper integration mode for Obsidian.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.77+-orange?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.85+-orange?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![macOS](https://img.shields.io/badge/macOS-11+-000000?logo=apple&logoColor=white)](https://www.apple.com/macos/)
 [![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-Metal%20GPU-blue?logo=apple)](https://developer.apple.com/metal/)
 [![100% Local](https://img.shields.io/badge/100%25-local-success)](#why)
@@ -87,7 +87,7 @@ The "tag intelligence" piece is the interesting one: most LLM summarizers will h
   curl -L -o "$HOME/Library/Application Support/stt-md/models/ggml-large-v3-turbo.bin" \
     https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin
   ```
-- **Rust 1.77+** (only needed to build from source)
+- **Rust 1.85+** (only needed to build from source; the crate uses edition 2024)
 
 ## Install
 
@@ -129,6 +129,9 @@ ollama_model = "qwen2.5:7b"
 ollama_url = "http://localhost:11434"
 whisper_language = "es"
 whisper_model_filename = "ggml-large-v3-turbo.bin"
+
+# Optional: domain vocabulary to bias Whisper's spelling of names/jargon.
+# whisper_initial_prompt = "Reunión de MiEmpresa: ProyectoX, Kubernetes, Ana, Joaquín."
 ```
 
 In simple mode the LLM picks tags freely (max 4, lowercase kebab-case) and there's no daily-note coupling. Output looks like:
@@ -142,7 +145,7 @@ In simple mode the LLM picks tags freely (max 4, lowercase kebab-case) and there
 
 ### `obsidian` mode
 
-Full vault integration: scans your vault for tags + wikilinks, writes to `<vault>/2-calendar/YYYY/MM/meetings/`, and appends a wikilink to today's daily under `## 🤖 Agent Log`.
+Full vault integration: scans your vault for tags + wikilinks, writes the meeting note into your vault, and appends a wikilink to today's daily under `## 🤖 Agent Log`.
 
 ```toml
 output_mode = "obsidian"
@@ -152,6 +155,21 @@ ollama_model = "qwen2.5:7b"
 ollama_url = "http://localhost:11434"
 whisper_language = "es"
 whisper_model_filename = "ggml-large-v3-turbo.bin"
+
+# Where meeting notes land and which daily gets the link, relative to the
+# vault. Placeholders: {year} {month} {week} (ISO, 2 digits) {date}.
+# Defaults shown; adapt to your vault layout:
+meetings_dir = "2-calendar/{year}/{month}/meetings"
+daily_note = "2-calendar/{year}/{month}/{date}.md"
+
+# Optional: folder whose subfolders (up to 2 levels) are your life/work areas.
+# The LLM attributes each meeting to one of them (closed list, hallucinations
+# dropped) and it lands as `area:` in the frontmatter.
+# areas_dir = "areas"
+
+# Optional: if the daily note doesn't exist yet, create it from this template
+# (supports {{date:YYYY-MM-DD}} and {{date:dddd}}) instead of a minimal stub.
+# daily_template = "_templates/daily.md"
 ```
 
 The vault is scanned every time you stop a recording. Hallucinated tags / wikilinks (anything not actually present in the vault) are filtered out post-hoc — the vault is the source of truth, the LLM is treated as untrusted input.
@@ -243,6 +261,8 @@ src/
 ├── audio_utils.rs       # WAV load + mono + linear resample
 ├── recording/
 │   ├── mic.rs           # cpal stream
+│   ├── system_audio.rs  # ScreenCaptureKit system-audio tap (macOS 13+)
+│   ├── mixer.rs         # mic + system downmix/mix thread
 │   └── wav_writer.rs    # hound writer on its own thread
 ├── transcription/
 │   └── whisper.rs       # whisper-rs wrapper with initial_prompt
@@ -301,18 +321,18 @@ This is a small piece of code (`MeetingSummary::enforce_vocab` in `src/llm/mod.r
 
 ## Known limitations
 
-- **Mic only.** No system-audio capture (Zoom/Meet). Use [stt-tomi](https://github.com/Zackriya-Solutions/meeting-minutes) with BlackHole if you need that.
+- **System audio needs macOS 13+ and Screen Recording permission** (ScreenCaptureKit). Without either, the app records mic-only and says so in the tooltip.
 - **Batch at stop**, not streaming.
-- **Linear resampling** with no anti-aliasing low-pass. Fine for speech (80–4000 Hz). Swap for `rubato` if you need fidelity.
+- **Linear resampling** with no anti-aliasing low-pass. Fine for speech (80–4000 Hz).
 - **No code signing.** macOS will ask "Open Anyway" once per build. For wider distribution you'd need an Apple Developer ID ($99/year).
 - **Spanish-Obsidian opinionated.** Menu labels and the prompt template are in Spanish; the output schema assumes a `2-calendar/YYYY/MM/` daily-note vault. Both are easy to adapt — PRs welcome.
 
 ## Roadmap
 
+- [x] System audio capture (ScreenCaptureKit, macOS 13+; falls back to mic-only)
 - [ ] VAD streaming during recording (port stt-tomi's Silero pipeline)
 - [ ] Configurable output schema (multilingual labels, alternative folder layouts)
 - [ ] Re-process an existing `.md` (re-run the summarizer with a different model)
-- [ ] System audio via Core Audio TAP (no BlackHole on macOS 14.4+)
 - [ ] Code signing + DMG distribution
 
 ## Contributing

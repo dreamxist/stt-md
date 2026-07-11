@@ -58,6 +58,37 @@ pub fn scan_vault(root: &Path) -> Result<VaultVocabulary> {
     Ok(vocab)
 }
 
+/// Lists area paths (relative to `areas_dir`, e.g. "work", "work/acmecorp")
+/// walking up to two levels of subfolders. Used as a closed list so the LLM
+/// can attribute a meeting to an existing area but never invent one.
+pub fn scan_areas(vault_root: &Path, areas_dir: &str) -> Vec<String> {
+    let root = vault_root.join(areas_dir);
+    let mut areas = Vec::new();
+    for entry in WalkDir::new(&root)
+        .min_depth(1)
+        .max_depth(2)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_dir() {
+            continue;
+        }
+        if entry
+            .file_name()
+            .to_str()
+            .map(|n| n.starts_with('.') || n.starts_with('_'))
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        if let Ok(rel) = entry.path().strip_prefix(&root) {
+            areas.push(rel.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    areas.sort();
+    areas
+}
+
 fn is_excluded(path: &Path) -> bool {
     let s = path.to_string_lossy();
     s.contains("/.git")
@@ -155,4 +186,76 @@ fn extract_inline_tags(content: &str) -> Vec<String> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frontmatter_extraction() {
+        let doc = "---\ntags: [a, b]\ntitle: x\n---\nbody";
+        assert_eq!(extract_frontmatter(doc), Some("tags: [a, b]\ntitle: x"));
+        assert_eq!(extract_frontmatter("no frontmatter"), None);
+    }
+
+    #[test]
+    fn frontmatter_tags_inline_array() {
+        let tags = extract_tags_from_frontmatter("tags: [meeting, \"ai-draft\", #x]");
+        assert_eq!(tags, vec!["meeting", "ai-draft", "x"]);
+    }
+
+    #[test]
+    fn frontmatter_tags_block_list() {
+        let fm = "title: x\ntags:\n  - daily\n  - review\nauthor: y";
+        let tags = extract_tags_from_frontmatter(fm);
+        assert_eq!(tags, vec!["daily", "review"]);
+    }
+
+    #[test]
+    fn inline_tags_basic() {
+        let tags = extract_inline_tags("hola #standup y #proyecto-x pero no#esto ni #123 ni # solo");
+        assert_eq!(tags, vec!["standup", "proyecto-x"]);
+    }
+
+    #[test]
+    fn inline_tags_ignore_uppercase_and_anchors() {
+        let tags = extract_inline_tags("issue #42, #Titulo, #ok");
+        assert_eq!(tags, vec!["ok"]);
+    }
+}
+
+#[cfg(test)]
+mod area_tests {
+    use super::*;
+
+    #[test]
+    fn scan_areas_lists_two_levels_and_skips_hidden() {
+        let root = std::env::temp_dir().join(format!("stt-md-areas-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for d in [
+            "areas/personal/entrenamiento",
+            "areas/work/acmecorp",
+            "areas/work/empresa",
+            "areas/.oculta",
+            "areas/_meta",
+            "areas/work/acmecorp/muy/profundo",
+        ] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let areas = scan_areas(&root, "areas");
+        assert_eq!(
+            areas,
+            vec![
+                "personal",
+                "personal/entrenamiento",
+                "work",
+                "work/empresa",
+                "work/acmecorp",
+            ]
+        );
+        // Missing areas dir → empty list, no error.
+        assert!(scan_areas(&root, "no-existe").is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

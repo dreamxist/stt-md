@@ -3,7 +3,7 @@ use chrono::Local;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use stt_md::{audio_utils, paths, transcription::whisper::WhisperEngine, vault};
+use stt_md::{audio_utils, config::Config, paths, transcription::whisper::WhisperEngine, vault};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -24,13 +24,18 @@ fn main() -> Result<()> {
         t0.elapsed().as_millis()
     );
 
-    let model_path = paths::whisper_model_path();
+    let cfg = Config::load_or_init()?;
+    let model_path = cfg.whisper_model_path();
     let t0 = Instant::now();
     let engine = WhisperEngine::load(&model_path)?;
     println!("loaded model in {}ms", t0.elapsed().as_millis());
 
     let t0 = Instant::now();
-    let segments = engine.transcribe(&resampled)?;
+    let segments = engine.transcribe(
+        &resampled,
+        &cfg.whisper_language,
+        cfg.whisper_initial_prompt.as_deref(),
+    )?;
     println!(
         "transcribed {} segments in {}ms",
         segments.len(),

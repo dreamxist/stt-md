@@ -6,16 +6,17 @@ use std::path::{Path, PathBuf};
 use crate::llm::MeetingSummary;
 use crate::transcription::TranscriptSegment;
 
-/// Writes the full meeting markdown into `<vault>/2-calendar/YYYY/MM/meetings/`.
-/// Returns both the absolute path and the vault-relative path (used by the
-/// daily appender to build the wikilink).
+/// Writes the full meeting markdown into `<vault>/<meetings_dir_rel>/`.
+/// Returns the absolute path and the file stem (basename without `.md`),
+/// which the daily appender uses to build the wikilink.
 pub struct WrittenMeeting {
     pub absolute_path: PathBuf,
-    pub vault_relative: String,
+    pub stem: String,
 }
 
 pub fn write_meeting(
     vault_root: &Path,
+    meetings_dir_rel: &str,
     started_at: DateTime<Local>,
     summary: &MeetingSummary,
     segments: &[TranscriptSegment],
@@ -23,19 +24,12 @@ pub fn write_meeting(
     audio_path: &Path,
 ) -> Result<WrittenMeeting> {
     let slug = slugify(&summary.title);
-    let year = started_at.format("%Y").to_string();
-    let month = started_at.format("%m").to_string();
-    let meetings_dir = vault_root
-        .join("2-calendar")
-        .join(&year)
-        .join(&month)
-        .join("meetings");
+    let meetings_dir = vault_root.join(meetings_dir_rel);
     fs::create_dir_all(&meetings_dir)?;
 
     let stem = format!("{}-{}", started_at.format("%Y-%m-%d-%H%M"), slug);
     let filename = format!("{stem}.md");
     let path = meetings_dir.join(&filename);
-    let vault_relative = format!("2-calendar/{year}/{month}/meetings/{stem}");
 
     let audio_filename = audio_path
         .file_name()
@@ -47,12 +41,15 @@ pub fn write_meeting(
     body.push_str(&format!("date: {}\n", started_at.format("%Y-%m-%d")));
     body.push_str(&format!("day: {}\n", day_name_es(&started_at)));
     body.push_str(&format!("time: {}\n", started_at.format("%H:%M")));
-    body.push_str(&format!("title: {}\n", summary.title));
+    body.push_str(&format!("title: {}\n", yaml_quote(&summary.title)));
     body.push_str(&format!("duration_min: {duration_min}\n"));
     body.push_str(&format!("tags: {}\n", format_tags_yaml(&summary.tags)));
     body.push_str(&format!("people: {}\n", format_list_yaml(&summary.people)));
     if let Some(link) = &summary.project_wikilink {
         body.push_str(&format!("project: \"{link}\"\n"));
+    }
+    if let Some(area) = &summary.area {
+        body.push_str(&format!("area: {}\n", yaml_quote(area)));
     }
     if !audio_filename.is_empty() {
         body.push_str(&format!("audio: {audio_filename}\n"));
@@ -114,21 +111,30 @@ pub fn write_meeting(
 
     Ok(WrittenMeeting {
         absolute_path: path,
-        vault_relative,
+        stem,
     })
 }
 
 fn format_tags_yaml(tags: &[String]) -> String {
     let mut all: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
-    if !all.iter().any(|t| *t == "meeting") {
+    if !all.contains(&"meeting") {
         all.insert(0, "meeting");
     }
-    if !all.iter().any(|t| *t == "ai-draft") {
+    if !all.contains(&"ai-draft") {
         // Mark drafts so the user knows they're auto-generated.
         let pos = all.iter().position(|t| *t == "meeting").map(|i| i + 1).unwrap_or(0);
         all.insert(pos, "ai-draft");
     }
     format!("[{}]", all.join(", "))
+}
+
+/// YAML double-quoted scalar: safe for titles with `:`, `#`, quotes, etc.
+pub fn yaml_quote(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    format!("\"{}\"", cleaned.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn format_list_yaml(items: &[String]) -> String {
@@ -201,7 +207,7 @@ pub fn write_basic_md(
     body.push_str("---\n");
     body.push_str(&format!("date: {}\n", started_at.format("%Y-%m-%d")));
     body.push_str(&format!("time: {}\n", started_at.format("%H:%M")));
-    body.push_str(&format!("title: {title}\n"));
+    body.push_str(&format!("title: {}\n", yaml_quote(title)));
     body.push_str(&format!("audio: {audio_filename}\n"));
     body.push_str("tags: [meeting, ai-draft]\n");
     body.push_str("source: stt-md\n");
@@ -216,4 +222,38 @@ pub fn write_basic_md(
 
     fs::write(&path, body)?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slugify_strips_accents_and_symbols() {
+        assert_eq!(slugify("Acme: standup #2 (María)"), "acme-standup-2-maria");
+        assert_eq!(slugify("  ---  "), "");
+        assert_eq!(slugify("año nuevo"), "ano-nuevo");
+    }
+
+    #[test]
+    fn yaml_quote_escapes_specials() {
+        assert_eq!(yaml_quote("plain"), "\"plain\"");
+        assert_eq!(yaml_quote("Sync: roadmap"), "\"Sync: roadmap\"");
+        assert_eq!(yaml_quote("con \"comillas\""), "\"con \\\"comillas\\\"\"");
+        assert_eq!(yaml_quote("back\\slash"), "\"back\\\\slash\"");
+        assert_eq!(yaml_quote("multi\nline"), "\"multi line\"");
+    }
+
+    #[test]
+    fn format_tags_adds_meeting_and_ai_draft_once() {
+        assert_eq!(
+            format_tags_yaml(&["acme".to_string()]),
+            "[meeting, ai-draft, acme]"
+        );
+        assert_eq!(
+            format_tags_yaml(&["meeting".to_string(), "ai-draft".to_string()]),
+            "[meeting, ai-draft]"
+        );
+        assert_eq!(format_tags_yaml(&[]), "[meeting, ai-draft]");
+    }
 }

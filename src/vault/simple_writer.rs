@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::llm::MeetingSummary;
 use crate::transcription::TranscriptSegment;
 
-use super::meeting_writer::slugify;
+use super::meeting_writer::{slugify, yaml_quote};
 
 /// Plain-Markdown writer (used when `output_mode = "simple"`).
 /// Writes to `<output_dir>/YYYY-MM-DD-HHMM-slug.md` with no wikilinks,
@@ -42,7 +42,7 @@ pub fn write_simple(
     body.push_str("---\n");
     body.push_str(&format!("date: {}\n", started_at.format("%Y-%m-%d")));
     body.push_str(&format!("time: {}\n", started_at.format("%H:%M")));
-    body.push_str(&format!("title: {}\n", summary.title));
+    body.push_str(&format!("title: {}\n", yaml_quote(&summary.title)));
     body.push_str(&format!("duration_min: {duration_min}\n"));
     body.push_str(&format!("tags: {tags_yaml}\n"));
     body.push_str(&format!("people: {people_yaml}\n"));

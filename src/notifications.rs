@@ -12,6 +12,14 @@ pub fn meeting_saved(meeting_path: &Path) {
         .show();
 }
 
+pub fn recording_failed(err: &str) {
+    let _ = notify_rust::Notification::new()
+        .summary("No se pudo iniciar la grabación")
+        .body(err)
+        .appname("stt-md")
+        .show();
+}
+
 pub fn meeting_failed(err: &str) {
     let _ = notify_rust::Notification::new()
         .summary("Error procesando reunión")

@@ -18,10 +18,6 @@ pub fn models_dir() -> PathBuf {
     p
 }
 
-pub fn whisper_model_path() -> PathBuf {
-    models_dir().join("ggml-large-v3-turbo.bin")
-}
-
 pub fn transcripts_dir() -> PathBuf {
     let p = app_support_dir().join("transcripts");
     let _ = std::fs::create_dir_all(&p);

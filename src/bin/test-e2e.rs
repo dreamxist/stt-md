@@ -3,7 +3,7 @@ use chrono::Local;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use stt_md::{audio_utils, llm, paths, transcription::whisper::WhisperEngine, vault};
+use stt_md::{audio_utils, config::Config, llm, transcription::whisper::WhisperEngine, vault};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -29,12 +29,17 @@ fn main() -> Result<()> {
         t0.elapsed().as_millis()
     );
 
+    let cfg = Config::load_or_init()?;
     let t0 = Instant::now();
-    let engine = WhisperEngine::load(&paths::whisper_model_path())?;
+    let engine = WhisperEngine::load(&cfg.whisper_model_path())?;
     println!("[2/5] loaded whisper model in {}ms", t0.elapsed().as_millis());
 
     let t0 = Instant::now();
-    let segments = engine.transcribe(&resampled)?;
+    let segments = engine.transcribe(
+        &resampled,
+        &cfg.whisper_language,
+        cfg.whisper_initial_prompt.as_deref(),
+    )?;
     println!(
         "[2/5] transcribed {} segments in {}ms",
         segments.len(),
@@ -48,12 +53,18 @@ fn main() -> Result<()> {
 
     let t0 = Instant::now();
     let vocab = vault::scanner::scan_vault(&vault_root)?;
+    let areas = cfg
+        .areas_dir
+        .as_deref()
+        .map(|d| vault::scanner::scan_areas(&vault_root, d))
+        .unwrap_or_default();
     println!(
-        "[3/5] scanned vault in {}ms ({} fm tags, {} inline tags, {} wikilinks)",
+        "[3/5] scanned vault in {}ms ({} fm tags, {} inline tags, {} wikilinks, {} areas)",
         t0.elapsed().as_millis(),
         vocab.frontmatter_tags.len(),
         vocab.inline_tags.len(),
-        vocab.wikilink_targets.len()
+        vocab.wikilink_targets.len(),
+        areas.len()
     );
 
     let transcript_text: String = segments
@@ -65,7 +76,7 @@ fn main() -> Result<()> {
         })
         .collect();
 
-    let prompt = llm::prompts::build_summary_prompt(&transcript_text, &vocab);
+    let prompt = llm::prompts::build_summary_prompt(&transcript_text, &vocab, &areas);
     println!("[4/5] calling Ollama...");
     let t0 = Instant::now();
     let raw = llm::ollama::generate_json(
@@ -78,9 +89,11 @@ fn main() -> Result<()> {
     let mut summary: llm::MeetingSummary = serde_json::from_str(&raw)
         .map_err(|e| anyhow::anyhow!("invalid JSON: {e}\nraw:\n{raw}"))?;
     summary.enforce_vocab(&vocab);
+    summary.enforce_area(&areas);
     println!("[4/5] summary: {}", summary.title);
     println!("      tags: {:?}", summary.tags);
     println!("      project: {:?}", summary.project_wikilink);
+    println!("      area: {:?}", summary.area);
     println!("      people: {:?}", summary.people);
     println!("      decisions: {}", summary.decisions.len());
     println!("      action_items: {}", summary.action_items.len());
@@ -88,8 +101,16 @@ fn main() -> Result<()> {
     let started_at = Local::now();
     let duration_min = (resampled.len() as i64 / 16_000 / 60).max(1);
 
+    let meetings_dir_rel = vault::expand_pattern(&cfg.meetings_dir, &started_at);
+    let daily_note_rel = vault::expand_pattern(&cfg.daily_note, &started_at);
+    let daily_template = cfg
+        .daily_template
+        .as_deref()
+        .and_then(|rel| std::fs::read_to_string(vault_root.join(rel)).ok());
+
     let written = vault::meeting_writer::write_meeting(
         &vault_root,
+        &meetings_dir_rel,
         started_at,
         &summary,
         &segments,
@@ -100,9 +121,11 @@ fn main() -> Result<()> {
 
     let daily_path = vault::daily_appender::append_meeting_link(
         &vault_root,
+        &daily_note_rel,
+        daily_template.as_deref(),
         started_at,
         &summary.title,
-        &written.vault_relative,
+        &written.stem,
         duration_min,
     )?;
     println!("[5/5] updated daily   → {}", daily_path.display());

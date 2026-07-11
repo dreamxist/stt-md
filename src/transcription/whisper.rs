@@ -4,6 +4,11 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 
 use super::TranscriptSegment;
 
+const DEFAULT_INITIAL_PROMPT: &str =
+    "Reunión técnica de software en español. Vocabulario común: \
+     whisper, Ollama, Obsidian, vault, prompt, LLM, frontend, backend, \
+     deploy, sprint, standup, PR, merge, commit.";
+
 pub struct WhisperEngine {
     ctx: WhisperContext,
 }
@@ -19,25 +24,26 @@ impl WhisperEngine {
         Ok(Self { ctx })
     }
 
-    /// Transcribe 16kHz mono f32 samples in Spanish.
-    pub fn transcribe(&self, samples_16k_mono: &[f32]) -> Result<Vec<TranscriptSegment>> {
+    /// Transcribe 16kHz mono f32 samples. `language` is a whisper.cpp language
+    /// code ("es", "en", "auto", …). `initial_prompt` biases spelling of domain
+    /// vocabulary; `None` uses a generic Spanish default.
+    pub fn transcribe(
+        &self,
+        samples_16k_mono: &[f32],
+        language: &str,
+        initial_prompt: Option<&str>,
+    ) -> Result<Vec<TranscriptSegment>> {
         let mut state = self.ctx.create_state()?;
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-        params.set_language(Some("es"));
+        params.set_language(Some(language));
         params.set_translate(false);
         params.set_print_special(false);
         params.set_print_progress(false);
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
         params.set_n_threads(num_cpus_for_whisper());
-        params.set_initial_prompt(
-            "Reunión técnica de software en español chileno. \
-             Vocabulario común: whisper, Ollama, Obsidian, vault, prompt, LLM, \
-             stt-md, Acme, IMC Labs, Tauri, Rust, TypeScript, Next.js, React, \
-             Supabase, AWS, Anthropic, Claude, MCP, agente, embedding, \
-             frontend, backend, deploy, sprint, standup, PR, merge, commit.",
-        );
+        params.set_initial_prompt(initial_prompt.unwrap_or(DEFAULT_INITIAL_PROMPT));
 
         state.full(params, samples_16k_mono)?;
 

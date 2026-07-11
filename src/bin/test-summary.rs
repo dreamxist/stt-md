@@ -34,7 +34,7 @@ fn main() -> Result<()> {
 [01:05] Diego: Perfecto. Cerramos.
 "#;
 
-    let prompt = llm::prompts::build_summary_prompt(fake_transcript, &vocab);
+    let prompt = llm::prompts::build_summary_prompt(fake_transcript, &vocab, &[]);
     println!("\n--- PROMPT ({} chars) ---", prompt.len());
 
     println!("\ncalling ollama (qwen2.5:7b)...");
