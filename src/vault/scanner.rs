@@ -250,8 +250,8 @@ mod area_tests {
                 "personal",
                 "personal/entrenamiento",
                 "work",
-                "work/empresa",
                 "work/acmecorp",
+                "work/empresa",
             ]
         );
         // Missing areas dir → empty list, no error.
