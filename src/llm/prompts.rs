@@ -69,6 +69,7 @@ REGLAS DURAS:
 6. NUNCA inventes personas. Si la transcripción NO menciona nombres propios explícitamente, devuelve people = []. Mejor lista vacía que nombres alucinados.
 7. Si la transcripción es solo un monólogo de prueba o saludo (sin reunión real), title puede ser "Nota rápida", summary breve, decisions/action_items/people vacíos.
 {area_rule}
+9. Si las líneas traen prefijo de hablante: "yo:" es el usuario local (dueño de esta nota) y "ellos:" son los demás participantes. Úsalo para atribuir decisiones y "who" en action_items: lo que dice "yo" comprometerse a hacer es del usuario local; lo que "ellos" se comprometen es de la persona correspondiente.
 
 SCHEMA EXACTO:
 {{
@@ -130,6 +131,7 @@ REGLAS DURAS:
 6. "tags": máximo {max_tags} tags en kebab-case lowercase, descriptivos del contenido (ej: "standup", "planning", "retro", "1on1"). Sin tildes ni símbolos.
 7. project_wikilink: siempre null en este modo.
 8. Si la transcripción es solo una nota rápida o saludo (sin reunión real), title puede ser "Nota rápida", listas vacías.
+9. Si las líneas traen prefijo de hablante: "yo:" es el usuario local (dueño de esta nota) y "ellos:" son los demás participantes. Úsalo para atribuir decisiones y "who" en action_items.
 
 SCHEMA EXACTO:
 {{

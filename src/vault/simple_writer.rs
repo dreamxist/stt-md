@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::llm::MeetingSummary;
 use crate::transcription::TranscriptSegment;
 
-use super::meeting_writer::{slugify, yaml_quote};
+use super::meeting_writer::{format_segment_line, slugify, yaml_quote};
 
 /// Plain-Markdown writer (used when `output_mode = "simple"`).
 /// Writes to `<output_dir>/YYYY-MM-DD-HHMM-slug.md` with no wikilinks,
@@ -18,6 +18,7 @@ pub fn write_simple(
     segments: &[TranscriptSegment],
     duration_min: i64,
     audio_path: &Path,
+    audio_sys_path: Option<&Path>,
 ) -> Result<PathBuf> {
     fs::create_dir_all(output_dir)?;
     let slug = slugify(&summary.title);
@@ -48,6 +49,9 @@ pub fn write_simple(
     body.push_str(&format!("people: {people_yaml}\n"));
     if !audio_filename.is_empty() {
         body.push_str(&format!("audio: {audio_filename}\n"));
+    }
+    if let Some(sys_name) = audio_sys_path.and_then(|p| p.file_name()) {
+        body.push_str(&format!("audio_sys: {}\n", sys_name.to_string_lossy()));
     }
     body.push_str("source: stt-md\n");
     body.push_str("---\n\n");
@@ -95,9 +99,7 @@ pub fn write_simple(
     body.push_str("## Transcripción\n\n");
     body.push_str("<details>\n<summary>Ver transcripción completa</summary>\n\n");
     for s in segments {
-        let mins = s.start_ms / 60_000;
-        let secs = (s.start_ms % 60_000) / 1000;
-        body.push_str(&format!("[{:02}:{:02}] {}\n", mins, secs, s.text));
+        body.push_str(&format_segment_line(s));
     }
     body.push_str("\n</details>\n");
 

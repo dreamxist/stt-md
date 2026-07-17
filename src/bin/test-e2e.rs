@@ -8,47 +8,74 @@ use stt_md::{audio_utils, config::Config, llm, transcription::whisper::WhisperEn
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: test-e2e <wav-path> <vault-root>");
+        eprintln!("usage: test-e2e <mic.wav> [sys.wav] <vault-root>");
         std::process::exit(1);
     }
     let wav_path = PathBuf::from(&args[1]);
-    let vault_root = PathBuf::from(&args[2]);
+    let (sys_wav_path, vault_root) = if args.len() >= 4 {
+        (Some(PathBuf::from(&args[2])), PathBuf::from(&args[3]))
+    } else {
+        (None, PathBuf::from(&args[2]))
+    };
 
     println!("=== test-e2e ===");
-    println!("wav:   {}", wav_path.display());
-    println!("vault: {}", vault_root.display());
+    println!("mic wav: {}", wav_path.display());
+    if let Some(p) = &sys_wav_path {
+        println!("sys wav: {}", p.display());
+    }
+    println!("vault:   {}", vault_root.display());
     println!();
 
-    let t0 = Instant::now();
-    let (mono, sr) = audio_utils::load_wav_mono_f32(&wav_path)
-        .with_context(|| format!("failed to load {}", wav_path.display()))?;
-    let resampled = audio_utils::resample_to_16k(&mono, sr);
-    println!(
-        "[1/5] loaded {:.1}s of audio in {}ms",
-        resampled.len() as f32 / 16_000.0,
-        t0.elapsed().as_millis()
-    );
+    let load = |path: &PathBuf| -> Result<Vec<f32>> {
+        let t0 = Instant::now();
+        let (mono, sr) = audio_utils::load_wav_mono_f32(path)
+            .with_context(|| format!("failed to load {}", path.display()))?;
+        let resampled = audio_utils::resample_to_16k(&mono, sr);
+        println!(
+            "[1/5] loaded {:.1}s from {} in {}ms",
+            resampled.len() as f32 / 16_000.0,
+            path.display(),
+            t0.elapsed().as_millis()
+        );
+        Ok(resampled)
+    };
+    let mic_samples = load(&wav_path)?;
+    let sys_samples = sys_wav_path.as_ref().map(load).transpose()?;
 
     let cfg = Config::load_or_init()?;
     let t0 = Instant::now();
     let engine = WhisperEngine::load(&cfg.whisper_model_path())?;
     println!("[2/5] loaded whisper model in {}ms", t0.elapsed().as_millis());
 
-    let t0 = Instant::now();
-    let segments = engine.transcribe(
-        &resampled,
-        &cfg.whisper_language,
-        cfg.whisper_initial_prompt.as_deref(),
-    )?;
-    println!(
-        "[2/5] transcribed {} segments in {}ms",
-        segments.len(),
-        t0.elapsed().as_millis()
-    );
+    let transcribe = |samples: &[f32], label: &str| -> Result<Vec<stt_md::transcription::TranscriptSegment>> {
+        let t0 = Instant::now();
+        let segs = engine.transcribe(
+            samples,
+            &cfg.whisper_language,
+            cfg.whisper_initial_prompt.as_deref(),
+        )?;
+        println!(
+            "[2/5] transcribed {} ({} segments) in {}ms",
+            label,
+            segs.len(),
+            t0.elapsed().as_millis()
+        );
+        Ok(segs)
+    };
+
+    let mic_segments = transcribe(&mic_samples, "mic")?;
+    let segments = match &sys_samples {
+        Some(sys) => {
+            let sys_segments = transcribe(sys, "system")?;
+            stt_md::transcription::merge_segments(mic_segments, sys_segments)
+        }
+        None => mic_segments,
+    };
     for s in &segments {
         let mins = s.start_ms / 60_000;
         let secs = (s.start_ms % 60_000) / 1000;
-        println!("      [{:02}:{:02}] {}", mins, secs, s.text);
+        let label = s.speaker.map(|sp| format!("{}: ", sp.label())).unwrap_or_default();
+        println!("      [{:02}:{:02}] {}{}", mins, secs, label, s.text);
     }
 
     let t0 = Instant::now();
@@ -72,7 +99,10 @@ fn main() -> Result<()> {
         .map(|s| {
             let mins = s.start_ms / 60_000;
             let secs = (s.start_ms % 60_000) / 1000;
-            format!("[{:02}:{:02}] {}\n", mins, secs, s.text)
+            match s.speaker {
+                Some(sp) => format!("[{:02}:{:02}] {}: {}\n", mins, secs, sp.label(), s.text),
+                None => format!("[{:02}:{:02}] {}\n", mins, secs, s.text),
+            }
         })
         .collect();
 
@@ -99,7 +129,10 @@ fn main() -> Result<()> {
     println!("      action_items: {}", summary.action_items.len());
 
     let started_at = Local::now();
-    let duration_min = (resampled.len() as i64 / 16_000 / 60).max(1);
+    let longest_track = mic_samples
+        .len()
+        .max(sys_samples.as_ref().map_or(0, |s| s.len()));
+    let duration_min = (longest_track as i64 / 16_000 / 60).max(1);
 
     let meetings_dir_rel = vault::expand_pattern(&cfg.meetings_dir, &started_at);
     let daily_note_rel = vault::expand_pattern(&cfg.daily_note, &started_at);
@@ -116,6 +149,7 @@ fn main() -> Result<()> {
         &segments,
         duration_min,
         &wav_path,
+        sys_wav_path.as_deref(),
     )?;
     println!("[5/5] wrote meeting → {}", written.absolute_path.display());
 

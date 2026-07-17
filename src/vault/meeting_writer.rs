@@ -22,6 +22,7 @@ pub fn write_meeting(
     segments: &[TranscriptSegment],
     duration_min: i64,
     audio_path: &Path,
+    audio_sys_path: Option<&Path>,
 ) -> Result<WrittenMeeting> {
     let slug = slugify(&summary.title);
     let meetings_dir = vault_root.join(meetings_dir_rel);
@@ -53,6 +54,9 @@ pub fn write_meeting(
     }
     if !audio_filename.is_empty() {
         body.push_str(&format!("audio: {audio_filename}\n"));
+    }
+    if let Some(sys_name) = audio_sys_path.and_then(|p| p.file_name()) {
+        body.push_str(&format!("audio_sys: {}\n", sys_name.to_string_lossy()));
     }
     body.push_str("type: meeting\n");
     body.push_str("source: stt-md\n");
@@ -101,9 +105,7 @@ pub fn write_meeting(
     body.push_str("## Transcripción\n\n");
     body.push_str("<details>\n<summary>Ver transcripción completa</summary>\n\n");
     for s in segments {
-        let mins = s.start_ms / 60_000;
-        let secs = (s.start_ms % 60_000) / 1000;
-        body.push_str(&format!("[{:02}:{:02}] {}\n", mins, secs, s.text));
+        body.push_str(&format_segment_line(s));
     }
     body.push_str("\n</details>\n");
 
@@ -113,6 +115,17 @@ pub fn write_meeting(
         absolute_path: path,
         stem,
     })
+}
+
+/// One transcript line: `[MM:SS] **yo:** texto` when the segment carries a
+/// speaker, plain `[MM:SS] texto` otherwise (single-track recordings).
+pub fn format_segment_line(s: &TranscriptSegment) -> String {
+    let mins = s.start_ms / 60_000;
+    let secs = (s.start_ms % 60_000) / 1000;
+    match s.speaker {
+        Some(sp) => format!("[{:02}:{:02}] **{}:** {}\n", mins, secs, sp.label(), s.text),
+        None => format!("[{:02}:{:02}] {}\n", mins, secs, s.text),
+    }
 }
 
 fn format_tags_yaml(tags: &[String]) -> String {
@@ -215,9 +228,7 @@ pub fn write_basic_md(
     body.push_str(&format!("# {title}\n\n"));
     body.push_str("## Transcripción\n\n");
     for s in segments {
-        let mins = s.start_ms / 60_000;
-        let secs = (s.start_ms % 60_000) / 1000;
-        body.push_str(&format!("[{:02}:{:02}] {}\n", mins, secs, s.text));
+        body.push_str(&format_segment_line(s));
     }
 
     fs::write(&path, body)?;
@@ -242,6 +253,22 @@ mod tests {
         assert_eq!(yaml_quote("con \"comillas\""), "\"con \\\"comillas\\\"\"");
         assert_eq!(yaml_quote("back\\slash"), "\"back\\\\slash\"");
         assert_eq!(yaml_quote("multi\nline"), "\"multi line\"");
+    }
+
+    #[test]
+    fn format_segment_line_renders_speaker_label() {
+        use crate::transcription::Speaker;
+        let mut s = TranscriptSegment {
+            start_ms: 65_000,
+            end_ms: 66_000,
+            text: "hola".to_string(),
+            speaker: Some(Speaker::Me),
+        };
+        assert_eq!(format_segment_line(&s), "[01:05] **yo:** hola\n");
+        s.speaker = Some(Speaker::Them);
+        assert_eq!(format_segment_line(&s), "[01:05] **ellos:** hola\n");
+        s.speaker = None;
+        assert_eq!(format_segment_line(&s), "[01:05] hola\n");
     }
 
     #[test]

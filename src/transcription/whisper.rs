@@ -61,6 +61,7 @@ impl WhisperEngine {
                 start_ms: seg.start_timestamp() * 10,
                 end_ms: seg.end_timestamp() * 10,
                 text,
+                speaker: None,
             });
         }
         if let Some(cutoff) = repetition_cutoff(&segments) {
@@ -115,6 +116,7 @@ mod tests {
             start_ms: 0,
             end_ms: 0,
             text: text.to_string(),
+            speaker: None,
         }
     }
 

@@ -17,7 +17,7 @@ use tray_icon::{Icon, TrayIconBuilder};
 
 use app_state::AppState;
 use config::{Config, OutputMode};
-use recording::RecordingSession;
+use recording::{RecordingOutput, RecordingSession};
 use transcription::whisper::WhisperEngine;
 
 enum ProcessingMsg {
@@ -201,8 +201,11 @@ fn run() -> anyhow::Result<()> {
                         .num_minutes()
                         .max(1);
                     match s.stop() {
-                        Ok(wav_path) => {
-                            println!("[stt-md] saved {}", wav_path.display());
+                        Ok(recording) => {
+                            println!("[stt-md] saved {}", recording.mic_path.display());
+                            if let Some(sys) = &recording.sys_path {
+                                println!("[stt-md] saved {}", sys.display());
+                            }
                             *st = AppState::Processing;
                             start_item.set_enabled(false);
                             stop_item.set_enabled(false);
@@ -218,7 +221,7 @@ fn run() -> anyhow::Result<()> {
                             let cfg_clone = cfg.clone();
                             thread::spawn(move || {
                                 let msg = match process_recording(
-                                    &wav_path,
+                                    &recording,
                                     started_at_local,
                                     duration_min,
                                     &cfg_clone,
@@ -290,25 +293,41 @@ fn build_tray(
         .build()?)
 }
 
-fn process_recording(
-    wav_path: &std::path::Path,
-    started_at_local: DateTime<Local>,
-    duration_min: i64,
-    cfg: &Config,
-) -> anyhow::Result<PathBuf> {
+fn load_track_16k(wav_path: &std::path::Path) -> anyhow::Result<Vec<f32>> {
     let t0 = Instant::now();
     let (mono, sr) = audio_utils::load_wav_mono_f32(wav_path)?;
     let resampled = audio_utils::resample_to_16k(&mono, sr);
     println!(
-        "[stt-md] loaded {:.1}s of audio in {}ms",
+        "[stt-md] loaded {:.1}s from {} in {}ms",
         resampled.len() as f32 / 16_000.0,
+        wav_path.display(),
         t0.elapsed().as_millis()
     );
+    Ok(resampled)
+}
 
-    if resampled.len() < 16_000 {
+fn process_recording(
+    recording: &RecordingOutput,
+    started_at_local: DateTime<Local>,
+    duration_min: i64,
+    cfg: &Config,
+) -> anyhow::Result<PathBuf> {
+    let mic_samples = load_track_16k(&recording.mic_path)?;
+    let sys_samples = recording
+        .sys_path
+        .as_deref()
+        .map(load_track_16k)
+        .transpose()?;
+
+    // A track shorter than 1s has nothing transcribable (e.g. system audio of
+    // a meeting where nobody else spoke). Skip it; only bail if every track
+    // is empty.
+    let mic_ok = mic_samples.len() >= 16_000;
+    let sys_ok = sys_samples.as_ref().is_some_and(|s| s.len() >= 16_000);
+    if !mic_ok && !sys_ok {
         anyhow::bail!(
             "la grabación dura menos de 1 segundo; no hay nada que transcribir (audio: {})",
-            wav_path.display()
+            recording.mic_path.display()
         );
     }
 
@@ -321,31 +340,46 @@ fn process_recording(
     let engine = WhisperEngine::load(&model_path)?;
     println!("[stt-md] model loaded in {}ms", t0.elapsed().as_millis());
 
-    let t0 = Instant::now();
-    let segments = engine.transcribe(
-        &resampled,
-        &cfg.whisper_language,
-        cfg.whisper_initial_prompt.as_deref(),
-    )?;
-    println!(
-        "[stt-md] transcribed {} segments in {}ms",
-        segments.len(),
-        t0.elapsed().as_millis()
-    );
+    let transcribe = |samples: &[f32], label: &str| -> anyhow::Result<Vec<transcription::TranscriptSegment>> {
+        let t0 = Instant::now();
+        let segs = engine.transcribe(
+            samples,
+            &cfg.whisper_language,
+            cfg.whisper_initial_prompt.as_deref(),
+        )?;
+        println!(
+            "[stt-md] transcribed {} ({} segments) in {}ms",
+            label,
+            segs.len(),
+            t0.elapsed().as_millis()
+        );
+        Ok(segs)
+    };
 
-    let transcript_text: String = segments
-        .iter()
-        .map(|s| {
-            let mins = s.start_ms / 60_000;
-            let secs = (s.start_ms % 60_000) / 1000;
-            format!("[{:02}:{:02}] {}\n", mins, secs, s.text)
-        })
-        .collect();
+    let mic_segments = if mic_ok {
+        transcribe(&mic_samples, "mic")?
+    } else {
+        Vec::new()
+    };
+
+    let segments = match &sys_samples {
+        // Two tracks: transcribe each separately and interleave with speaker
+        // labels — mixing them into one stream loses who spoke and clips.
+        Some(sys) if sys_ok => {
+            let sys_segments = transcribe(sys, "system")?;
+            transcription::merge_segments(mic_segments, sys_segments)
+        }
+        // System track present but empty → keep mic unlabeled (labels would
+        // be noise when there is only one voice source in the note).
+        _ => mic_segments,
+    };
+
+    let transcript_text: String = segments.iter().map(format_transcript_line).collect();
 
     match cfg.output_mode {
         OutputMode::Obsidian => process_obsidian_mode(
             cfg,
-            wav_path,
+            recording,
             started_at_local,
             duration_min,
             &segments,
@@ -353,7 +387,7 @@ fn process_recording(
         ),
         OutputMode::Simple => process_simple_mode(
             cfg,
-            wav_path,
+            recording,
             started_at_local,
             duration_min,
             &segments,
@@ -362,9 +396,18 @@ fn process_recording(
     }
 }
 
+fn format_transcript_line(s: &transcription::TranscriptSegment) -> String {
+    let mins = s.start_ms / 60_000;
+    let secs = (s.start_ms % 60_000) / 1000;
+    match s.speaker {
+        Some(sp) => format!("[{:02}:{:02}] {}: {}\n", mins, secs, sp.label(), s.text),
+        None => format!("[{:02}:{:02}] {}\n", mins, secs, s.text),
+    }
+}
+
 fn process_obsidian_mode(
     cfg: &Config,
-    wav_path: &std::path::Path,
+    recording: &RecordingOutput,
     started_at_local: DateTime<Local>,
     duration_min: i64,
     segments: &[transcription::TranscriptSegment],
@@ -416,7 +459,8 @@ fn process_obsidian_mode(
         &summary,
         segments,
         duration_min,
-        wav_path,
+        &recording.mic_path,
+        recording.sys_path.as_deref(),
     )?;
     println!("[stt-md] wrote meeting to {}", written.absolute_path.display());
 
@@ -436,7 +480,7 @@ fn process_obsidian_mode(
 
 fn process_simple_mode(
     cfg: &Config,
-    wav_path: &std::path::Path,
+    recording: &RecordingOutput,
     started_at_local: DateTime<Local>,
     duration_min: i64,
     segments: &[transcription::TranscriptSegment],
@@ -462,7 +506,8 @@ fn process_simple_mode(
         &summary,
         segments,
         duration_min,
-        wav_path,
+        &recording.mic_path,
+        recording.sys_path.as_deref(),
     )?;
     println!("[stt-md] wrote {}", path.display());
 
