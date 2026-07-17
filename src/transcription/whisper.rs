@@ -53,7 +53,7 @@ impl WhisperEngine {
             let Some(seg) = state.get_segment(i) else {
                 continue;
             };
-            let text = seg.to_str()?.trim().to_string();
+            let text = seg.to_str_lossy()?.trim().to_string();
             if text.is_empty() {
                 continue;
             }
@@ -62,6 +62,9 @@ impl WhisperEngine {
                 end_ms: seg.end_timestamp() * 10,
                 text,
             });
+        }
+        if let Some(cutoff) = repetition_cutoff(&segments) {
+            segments.truncate(cutoff);
         }
         Ok(segments)
     }
@@ -73,4 +76,82 @@ fn num_cpus_for_whisper() -> std::os::raw::c_int {
         .map(|n| n.get())
         .unwrap_or(4);
     (physical.saturating_sub(1).max(1)) as _
+}
+
+/// whisper.cpp can get stuck repeating the same phrase verbatim once real
+/// speech ends (e.g. silence tailing a long recording after everyone hangs
+/// up). Returns the index where a run of identical consecutive segments
+/// starts, so the caller can drop the hallucinated tail.
+///
+/// The threshold is deliberately high: real conversation legitimately
+/// repeats short interjections ("No. No. No. No.", "¿Puedo? ¿Puedo?
+/// ¿Puedo? ¿Puedo?") up to ~10 times in a row, while observed whisper.cpp
+/// hallucination loops run 15-140+ times once they start.
+fn repetition_cutoff(segments: &[TranscriptSegment]) -> Option<usize> {
+    const RUN_THRESHOLD: usize = 20;
+    let normalized: Vec<String> = segments
+        .iter()
+        .map(|s| s.text.trim().to_lowercase())
+        .collect();
+    let mut run_start = 0;
+    for i in 1..normalized.len() {
+        if normalized[i] == normalized[i - 1] {
+            if i - run_start + 1 >= RUN_THRESHOLD {
+                return Some(run_start);
+            }
+        } else {
+            run_start = i;
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seg(text: &str) -> TranscriptSegment {
+        TranscriptSegment {
+            start_ms: 0,
+            end_ms: 0,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn repetition_cutoff_finds_start_of_long_run() {
+        let mut segments = vec![seg("hola"), seg("como estas")];
+        segments.extend((0..20).map(|_| seg("Eu sei que ainda não terminam.")));
+        assert_eq!(repetition_cutoff(&segments), Some(2));
+    }
+
+    #[test]
+    fn repetition_cutoff_is_case_insensitive() {
+        let mut segments = vec![seg("hola")];
+        for i in 0..20 {
+            segments.push(seg(if i % 2 == 0 {
+                "Eu sei que ainda não terminam."
+            } else {
+                "EU SEI QUE AINDA NÃO TERMINAM."
+            }));
+        }
+        assert_eq!(repetition_cutoff(&segments), Some(1));
+    }
+
+    #[test]
+    fn repetition_cutoff_ignores_short_runs() {
+        // Real dialogue legitimately repeats short interjections many times
+        // in a row ("No. No. No. No.", "¿Puedo? ¿Puedo? ¿Puedo? ¿Puedo?").
+        // Observed max in real transcripts: 11 in a row.
+        let mut segments = vec![seg("antes")];
+        segments.extend((0..11).map(|_| seg("¿Puedo?")));
+        segments.push(seg("despues"));
+        assert_eq!(repetition_cutoff(&segments), None);
+    }
+
+    #[test]
+    fn repetition_cutoff_none_when_all_distinct() {
+        let segments = vec![seg("a"), seg("b"), seg("c")];
+        assert_eq!(repetition_cutoff(&segments), None);
+    }
 }
