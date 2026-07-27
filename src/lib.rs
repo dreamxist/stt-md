@@ -2,6 +2,7 @@ pub mod app_state;
 pub mod audio_utils;
 pub mod config;
 pub mod llm;
+pub mod meeting_detector;
 pub mod notifications;
 pub mod paths;
 pub mod recording;

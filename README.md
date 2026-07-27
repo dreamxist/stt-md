@@ -174,6 +174,18 @@ daily_note = "2-calendar/{year}/{month}/{date}.md"
 
 The vault is scanned every time you stop a recording. Hallucinated tags / wikilinks (anything not actually present in the vault) are filtered out post-hoc — the vault is the source of truth, the LLM is treated as untrusted input.
 
+### Meeting reminder (both modes)
+
+If you tend to forget to hit record, stt-md can nudge you: when a meeting app starts using the microphone while stt-md is idle, you get a *"¿Reunión en curso?"* notification. Detection uses CoreAudio process objects (macOS 14+, no extra permissions) against a whitelist of meeting apps — Zoom, Teams, Webex, Slack, Discord, FaceTime, WhatsApp and the major browsers (for Meet & co.). Because it's a whitelist, dictation apps like superwhisper never trigger it.
+
+```toml
+meeting_reminder = true   # default; set to false to disable
+# Override the built-in whitelist (lowercase bundle-ID prefixes):
+# meeting_reminder_apps = ["us.zoom.xos", "com.google.chrome"]
+```
+
+It notifies once per meeting (on the mic-grab transition), never while already recording, with a 5-minute anti-flap cooldown. On macOS < 14 the detector is silently inactive.
+
 ## Usage
 
 1. Click `STT` in the menubar → **"Empezar reunión"** (Spanish UI; PRs welcome for translations).
@@ -258,6 +270,7 @@ src/
 ├── paths.rs             # filesystem helpers
 ├── sounds.rs            # afplay wrappers (Tink / Pop)
 ├── notifications.rs     # notify-rust for macOS notifications
+├── meeting_detector.rs  # "¿Reunión en curso?" reminder (CoreAudio process objects)
 ├── audio_utils.rs       # WAV load + mono + linear resample
 ├── recording/
 │   ├── mic.rs           # cpal stream

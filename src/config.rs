@@ -62,6 +62,22 @@ pub struct Config {
     /// spell project names / jargon correctly). `None` uses a generic default.
     #[serde(default)]
     pub whisper_initial_prompt: Option<String>,
+
+    /// Notify "¿Reunión en curso?" when a meeting app (Zoom, Teams, a browser
+    /// running Meet, …) starts using the microphone while stt-md is idle.
+    /// Whitelist-based, so dictation apps (superwhisper & friends) never
+    /// trigger it. Needs macOS 14+; silently inactive on older systems.
+    #[serde(default = "default_true")]
+    pub meeting_reminder: bool,
+
+    /// Override the built-in meeting-app whitelist. Entries are lowercase
+    /// bundle-ID prefixes, e.g. ["us.zoom.xos", "com.google.chrome"].
+    #[serde(default)]
+    pub meeting_reminder_apps: Option<Vec<String>>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_output_dir() -> PathBuf {
@@ -104,6 +120,8 @@ impl Default for Config {
             whisper_language: "es".to_string(),
             whisper_model_filename: "ggml-large-v3-turbo.bin".to_string(),
             whisper_initial_prompt: None,
+            meeting_reminder: true,
+            meeting_reminder_apps: None,
         }
     }
 }

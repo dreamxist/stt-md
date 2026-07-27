@@ -1,5 +1,6 @@
 use stt_md::{
-    app_state, audio_utils, config, llm, notifications, recording, sounds, transcription, vault,
+    app_state, audio_utils, config, llm, meeting_detector, notifications, recording, sounds,
+    transcription, vault,
 };
 
 use std::path::PathBuf;
@@ -109,6 +110,10 @@ fn run() -> anyhow::Result<()> {
 
     let state = Arc::new(Mutex::new(AppState::Idle));
     let session: SessionSlot = Arc::new(Mutex::new(None));
+
+    if cfg.meeting_reminder {
+        meeting_detector::spawn(state.clone(), cfg.meeting_reminder_apps.clone());
+    }
 
     let (proc_tx, proc_rx): (Sender<ProcessingMsg>, Receiver<ProcessingMsg>) = unbounded();
 
