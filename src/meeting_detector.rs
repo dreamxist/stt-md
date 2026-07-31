@@ -40,9 +40,12 @@ const DEFAULT_MEETING_APPS: &[(&str, &str)] = &[
 ];
 
 const POLL_INTERVAL: Duration = Duration::from_secs(4);
-/// Mínimo entre avisos, por si el mic de la app parpadea (mute/unmute raro,
-/// reconexiones): evita una ráfaga de notificaciones para la misma reunión.
-const NOTIFY_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+/// Un corte de mic más corto que esto (cambio de dispositivo, reconexión de
+/// Meet) no cuenta como fin de reunión: sin esto, un parpadeo del mic
+/// reinicia la sesión y puede re-avisar por la misma reunión.
+const RELEASE_DEBOUNCE: Duration = Duration::from_secs(30);
+/// Resguardo extra entre avisos de sesiones distintas.
+const NOTIFY_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// Lanza el hilo detector. `custom_apps` (config `meeting_reminder_apps`)
 /// reemplaza la lista por defecto; son prefijos de bundle ID.
@@ -55,27 +58,49 @@ pub fn spawn(state: Arc<Mutex<AppState>>, custom_apps: Option<Vec<String>>) {
 fn run_loop(state: Arc<Mutex<AppState>>, custom_apps: Option<Vec<String>>) {
     let custom: Option<Vec<String>> =
         custom_apps.map(|v| v.into_iter().map(|s| s.to_ascii_lowercase()).collect());
-    // true mientras alguna app de la lista mantiene el mic abierto: se avisa
-    // solo en la transición inactivo → activo (una vez por reunión).
-    let mut meeting_active = false;
+
+    // Una "sesión" es un tramo continuo (con debounce) en que alguna app de
+    // la lista mantiene el mic. Se avisa a lo más una vez por sesión, y no
+    // necesariamente en el primer poll: si la reunión parte durante
+    // Processing (post-proceso de la reunión anterior) o dentro del cooldown,
+    // el aviso queda pendiente y sale apenas se pueda, en vez de perderse.
+    let mut in_session = false;
+    let mut handled = false;
+    let mut last_seen: Option<Instant> = None;
     let mut last_notified: Option<Instant> = None;
 
     loop {
         thread::sleep(POLL_INTERVAL);
-        let detected = detect_meeting_app(custom.as_deref());
-        match (&detected, meeting_active) {
-            (Some(app), false) => {
-                meeting_active = true;
-                let idle = matches!(*state.lock(), AppState::Idle);
-                let cooled = last_notified.is_none_or(|t| t.elapsed() >= NOTIFY_COOLDOWN);
-                if idle && cooled {
+
+        let Some(app) = detect_meeting_app(custom.as_deref()) else {
+            if in_session && last_seen.is_none_or(|t| t.elapsed() >= RELEASE_DEBOUNCE) {
+                in_session = false;
+            }
+            continue;
+        };
+
+        last_seen = Some(Instant::now());
+        if !in_session {
+            in_session = true;
+            handled = false;
+        }
+        if handled {
+            continue;
+        }
+        match *state.lock() {
+            // Ya están grabando esta reunión: no molestar, tampoco después
+            // (p. ej. si detienen la grabación antes de que termine la call).
+            AppState::Recording { .. } => handled = true,
+            // Esperar a Idle: reunión nueva durante el post-proceso.
+            AppState::Processing => {}
+            AppState::Idle => {
+                if last_notified.is_none_or(|t| t.elapsed() >= NOTIFY_COOLDOWN) {
                     println!("[stt-md] meeting detected: {app} is capturing the mic");
-                    notifications::meeting_detected(app);
+                    notifications::meeting_detected(&app);
+                    handled = true;
                     last_notified = Some(Instant::now());
                 }
             }
-            (None, true) => meeting_active = false,
-            _ => {}
         }
     }
 }

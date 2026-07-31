@@ -184,7 +184,7 @@ meeting_reminder = true   # default; set to false to disable
 # meeting_reminder_apps = ["us.zoom.xos", "com.google.chrome"]
 ```
 
-It notifies once per meeting (on the mic-grab transition), never while already recording, with a 5-minute anti-flap cooldown. On macOS < 14 the detector is silently inactive.
+It notifies once per meeting and never while already recording. If the mic grab happens while the previous recording is still post-processing, the reminder fires as soon as the app is idle again instead of being dropped. Short mic drops (<30 s — device switches, reconnects) don't count as a new meeting. On macOS < 14 the detector is silently inactive.
 
 ## Usage
 
