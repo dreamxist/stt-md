@@ -7,6 +7,50 @@ const MAX_FREE_TAGS: usize = 4;
 const MAX_TAGS_IN_PROMPT: usize = 150;
 const MAX_WIKILINKS_IN_PROMPT: usize = 100;
 
+/// Budget for the transcript alone, leaving room in the 32k context for the
+/// rules, the vault vocabulary and the answer.
+const MAX_TRANSCRIPT_CHARS: usize = 80_000;
+
+/// Whisper output grows with how much people talk, not with wall time: a dense
+/// 30-min meeting runs ~40 KB. Past the context window Ollama truncates the
+/// prompt from the front, which silently eats the rules and the schema above
+/// the transcript and leaves the model inventing its own response shape. Drop
+/// the middle instead so the instructions always survive.
+fn fit_transcript(transcript: &str) -> String {
+    if transcript.len() <= MAX_TRANSCRIPT_CHARS {
+        return transcript.to_string();
+    }
+
+    let head_budget = MAX_TRANSCRIPT_CHARS * 3 / 5;
+    let tail_budget = MAX_TRANSCRIPT_CHARS - head_budget;
+
+    // Split on line boundaries: slicing raw bytes would panic mid-UTF-8.
+    let mut head = String::with_capacity(head_budget);
+    for line in transcript.lines() {
+        if head.len() + line.len() + 1 > head_budget {
+            break;
+        }
+        head.push_str(line);
+        head.push('\n');
+    }
+
+    let mut tail: Vec<&str> = Vec::new();
+    let mut tail_len = 0;
+    for line in transcript.lines().rev() {
+        if tail_len + line.len() + 1 > tail_budget {
+            break;
+        }
+        tail_len += line.len() + 1;
+        tail.push(line);
+    }
+    tail.reverse();
+
+    format!(
+        "{head}\n[... tramo intermedio omitido: la reunión excede el contexto del modelo ...]\n\n{}\n",
+        tail.join("\n")
+    )
+}
+
 pub fn build_summary_prompt(transcript: &str, vocab: &VaultVocabulary, areas: &[String]) -> String {
     let mut all_tags: Vec<String> = vocab.all_tags();
     all_tags.sort();
@@ -107,7 +151,7 @@ JSON:"#,
         today_short = today.format("%Y-%m-%d"),
         tags_str = tags_str,
         wikilinks_str = wikilinks_str,
-        transcript = transcript,
+        transcript = fit_transcript(transcript),
     )
 }
 
@@ -153,6 +197,44 @@ JSON:"#,
         today_str = today_str,
         today_short = today_short,
         max_tags = MAX_FREE_TAGS,
-        transcript = transcript,
+        transcript = fit_transcript(transcript),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn transcript_of(lines: usize) -> String {
+        (0..lines)
+            .map(|i| format!("[{:02}:{:02}] línea número {i} de la reunión\n", i / 60, i % 60))
+            .collect()
+    }
+
+    #[test]
+    fn short_transcript_passes_through_untouched() {
+        let t = transcript_of(100);
+        assert!(t.len() < MAX_TRANSCRIPT_CHARS);
+        assert_eq!(fit_transcript(&t), t);
+    }
+
+    #[test]
+    fn long_transcript_keeps_both_ends_within_budget() {
+        let t = transcript_of(4_000);
+        assert!(t.len() > MAX_TRANSCRIPT_CHARS);
+
+        let fitted = fit_transcript(&t);
+        assert!(fitted.len() <= MAX_TRANSCRIPT_CHARS + 200);
+        assert!(fitted.contains("línea número 0 "));
+        assert!(fitted.contains("línea número 3999 "));
+        assert!(fitted.contains("tramo intermedio omitido"));
+    }
+
+    #[test]
+    fn rules_survive_for_a_transcript_that_used_to_blow_the_context() {
+        let prompt = build_summary_prompt(&transcript_of(4_000), &VaultVocabulary::default(), &[]);
+        assert!(prompt.starts_with("Eres un asistente"));
+        assert!(prompt.contains("REGLAS DURAS"));
+        assert!(prompt.contains("SCHEMA EXACTO"));
+    }
 }
