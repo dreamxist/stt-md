@@ -38,7 +38,11 @@ pub fn generate_json(prompt: &str, model: &str, base_url: &str) -> Result<String
         format: "json",
         options: OllamaOptions {
             temperature: 0.2,
-            num_ctx: 16_384,
+            // A 30-min meeting transcribes to ~40 KB, and the prompt adds the
+            // vault vocabulary on top. Past num_ctx Ollama truncates from the
+            // front — dropping the rules and schema, which sit above the
+            // transcript — and the model answers with an invented shape.
+            num_ctx: 32_768,
         },
     };
 
