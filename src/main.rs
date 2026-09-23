@@ -122,6 +122,7 @@ fn run() -> anyhow::Result<()> {
     // sticky title once set, so when processing ends the tray is rebuilt
     // (see the proc_rx handler below).
     let mut last_tick = Instant::now() - Duration::from_secs(2);
+    let mut silence_notified = false;
 
     event_loop.run(move |_event, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(250));
@@ -152,6 +153,28 @@ fn run() -> anyhow::Result<()> {
                 }
             }
             AppState::Idle => {}
+        }
+
+        // Safety net for a forgotten Stop: a recording that ran for two days
+        // produced a 12 GB WAV that never became a note.
+        let mut stop_requested = st.is_recording()
+            && session.lock().as_ref().is_some_and(|(_, started)| {
+                Local::now() - *started >= chrono::Duration::hours(MAX_RECORDING_HOURS)
+            });
+        // Nudge once per quiet stretch; talking again re-arms the reminder.
+        if let Some((s, _)) = session.lock().as_ref() {
+            let quiet = s.silent_for() >= SILENCE_REMINDER;
+            if quiet && !silence_notified {
+                let mins = SILENCE_REMINDER.as_secs() / 60;
+                println!("[stt-md] no voice for {mins} min while recording");
+                notifications::recording_silent(mins);
+            }
+            silence_notified = quiet;
+        }
+
+        if stop_requested {
+            println!("[stt-md] recording hit {MAX_RECORDING_HOURS}h; stopping automatically");
+            notifications::recording_auto_stopped(MAX_RECORDING_HOURS);
         }
 
         while let Ok(event) = menu_channel.try_recv() {
@@ -187,6 +210,9 @@ fn run() -> anyhow::Result<()> {
                                 "[stt-md] recording started (system audio: {})",
                                 if used_system { "yes" } else { "no — fallback to mic-only" }
                             );
+                            if !used_system {
+                                notifications::system_audio_unavailable();
+                            }
                         }
                         Err(e) => {
                             eprintln!("[stt-md] failed to start recording: {e:?}");
@@ -195,57 +221,61 @@ fn run() -> anyhow::Result<()> {
                     }
                 }
             } else if event.id == stop_id {
-                let mut st = state.lock();
-                if st.is_recording()
-                    && let Some((s, started_at_local)) = session.lock().take()
-                {
-                    sounds::play_stop();
-                    // Wall clock, not Instant: Instant stops while the Mac
-                    // sleeps, undercounting long meetings.
-                    let duration_min = (Local::now() - started_at_local)
-                        .num_minutes()
-                        .max(1);
-                    match s.stop() {
-                        Ok(recording) => {
-                            println!("[stt-md] saved {}", recording.mic_path.display());
-                            if let Some(sys) = &recording.sys_path {
-                                println!("[stt-md] saved {}", sys.display());
-                            }
-                            *st = AppState::Processing;
-                            start_item.set_enabled(false);
-                            stop_item.set_enabled(false);
-                            stop_item.set_text("Procesando…");
-                            if let Some(t) = tray.as_ref() {
-                                let _ = t.set_tooltip(Some(
-                                    "Procesando transcripción…".to_string(),
-                                ));
-                            }
-                            last_tick = Instant::now() - Duration::from_secs(2);
+                stop_requested = true;
+            }
+        }
 
-                            let proc_tx_clone = proc_tx.clone();
-                            let cfg_clone = cfg.clone();
-                            thread::spawn(move || {
-                                let msg = match process_recording(
-                                    &recording,
-                                    started_at_local,
-                                    duration_min,
-                                    &cfg_clone,
-                                ) {
-                                    Ok(p) => ProcessingMsg::Done(p),
-                                    Err(e) => {
-                                        eprintln!("[stt-md] processing error: {e:?}");
-                                        ProcessingMsg::Failed(e.to_string())
-                                    }
-                                };
-                                let _ = proc_tx_clone.send(msg);
-                            });
+        if stop_requested {
+            let mut st = state.lock();
+            if st.is_recording()
+                && let Some((s, started_at_local)) = session.lock().take()
+            {
+                sounds::play_stop();
+                // Wall clock, not Instant: Instant stops while the Mac
+                // sleeps, undercounting long meetings.
+                let duration_min = (Local::now() - started_at_local)
+                    .num_minutes()
+                    .max(1);
+                match s.stop() {
+                    Ok(recording) => {
+                        println!("[stt-md] saved {}", recording.mic_path.display());
+                        if let Some(sys) = &recording.sys_path {
+                            println!("[stt-md] saved {}", sys.display());
                         }
-                        Err(e) => {
-                            eprintln!("[stt-md] stop error: {e:?}");
-                            *st = AppState::Idle;
-                            start_item.set_enabled(true);
-                            stop_item.set_enabled(false);
+                        *st = AppState::Processing;
+                        start_item.set_enabled(false);
+                        stop_item.set_enabled(false);
+                        stop_item.set_text("Procesando…");
+                        if let Some(t) = tray.as_ref() {
+                            let _ = t.set_tooltip(Some(
+                                "Procesando transcripción…".to_string(),
+                            ));
                         }
+                        last_tick = Instant::now() - Duration::from_secs(2);
+
+                        let proc_tx_clone = proc_tx.clone();
+                        let cfg_clone = cfg.clone();
+                        thread::spawn(move || {
+                            let msg = match process_recording(
+                                &recording,
+                                started_at_local,
+                                duration_min,
+                                &cfg_clone,
+                            ) {
+                                Ok(p) => ProcessingMsg::Done(p),
+                                Err(e) => {
+                                    eprintln!("[stt-md] processing error: {e:?}");
+                                    ProcessingMsg::Failed(e.to_string())
+                                }
+                            };
+                            let _ = proc_tx_clone.send(msg);
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("[stt-md] stop error: {e:?}");
+                        *st = AppState::Idle;
+                        start_item.set_enabled(true);
+                        stop_item.set_enabled(false);
                     }
                 }
             }
@@ -518,6 +548,12 @@ fn process_simple_mode(
 
     Ok(path)
 }
+
+/// Hard cap on a single recording; beyond this the Stop was forgotten.
+const MAX_RECORDING_HOURS: i64 = 4;
+/// Quiet time after which a still-running recording is probably a forgotten
+/// Stop (meeting over, laptop left open).
+const SILENCE_REMINDER: Duration = Duration::from_secs(5 * 60);
 
 const APP_ICON_PNG: &[u8] = include_bytes!("../assets/icon-256.png");
 const TRAY_ICON_SIZE: u32 = 20;
