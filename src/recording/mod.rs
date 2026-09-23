@@ -6,14 +6,16 @@ use anyhow::{anyhow, Result};
 use chrono::Local;
 use crossbeam_channel::unbounded;
 use serde::{Deserialize, Serialize};
+use parking_lot::Mutex;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::paths;
 use mic::MicCapture;
 use system_audio::{SystemAudioCapture, SYSTEM_AUDIO_CHANNELS, SYSTEM_AUDIO_SAMPLE_RATE};
-use wav_writer::WavSink;
+use wav_writer::{LastVoice, WavSink};
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -38,6 +40,7 @@ pub struct RecordingSession {
     system: Option<SystemAudioCapture>,
     mic_wav: WavSink,
     sys_wav: Option<WavSink>,
+    last_voice: LastVoice,
 }
 
 impl RecordingSession {
@@ -65,7 +68,8 @@ impl RecordingSession {
         let (tx, rx) = unbounded::<Vec<f32>>();
         let mic = MicCapture::start(tx)?;
         let path = paths::recordings_dir().join(format!("{}.wav", timestamp_base()));
-        let mic_wav = WavSink::spawn(rx, mic.sample_rate, mic.channels, path)?;
+        let last_voice: LastVoice = Arc::new(Mutex::new(Instant::now()));
+        let mic_wav = WavSink::spawn(rx, mic.sample_rate, mic.channels, path, last_voice.clone())?;
         Ok(Self {
             started_at: Instant::now(),
             source: AudioSource::MicOnly,
@@ -73,6 +77,7 @@ impl RecordingSession {
             system: None,
             mic_wav,
             sys_wav: None,
+            last_voice,
         })
     }
 
@@ -91,12 +96,20 @@ impl RecordingSession {
         let mic_path = paths::recordings_dir().join(format!("{base}-mic.wav"));
         let sys_path = paths::recordings_dir().join(format!("{base}-sys.wav"));
 
-        let mic_wav = WavSink::spawn(mic_rx, mic.sample_rate, mic.channels, mic_path)?;
+        let last_voice: LastVoice = Arc::new(Mutex::new(Instant::now()));
+        let mic_wav = WavSink::spawn(
+            mic_rx,
+            mic.sample_rate,
+            mic.channels,
+            mic_path,
+            last_voice.clone(),
+        )?;
         let sys_wav = WavSink::spawn(
             sys_rx,
             SYSTEM_AUDIO_SAMPLE_RATE,
             SYSTEM_AUDIO_CHANNELS,
             sys_path,
+            last_voice.clone(),
         )?;
 
         Ok(Self {
@@ -106,7 +119,13 @@ impl RecordingSession {
             system: Some(system),
             mic_wav,
             sys_wav: Some(sys_wav),
+            last_voice,
         })
+    }
+
+    /// How long neither the mic nor the system audio has carried voice.
+    pub fn silent_for(&self) -> Duration {
+        self.last_voice.lock().elapsed()
     }
 
     pub fn stop(self) -> Result<RecordingOutput> {

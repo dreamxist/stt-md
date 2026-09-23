@@ -75,6 +75,12 @@ fn run_loop(state: Arc<Mutex<AppState>>, custom_apps: Option<Vec<String>>) {
         let Some(app) = detect_meeting_app(custom.as_deref()) else {
             if in_session && last_seen.is_none_or(|t| t.elapsed() >= RELEASE_DEBOUNCE) {
                 in_session = false;
+                // La app de reuniones soltó el mic pero seguimos grabando:
+                // lo típico es haber cortado la call y olvidar Detener.
+                if state.lock().is_recording() {
+                    println!("[stt-md] meeting app released the mic while recording");
+                    notifications::meeting_ended_still_recording();
+                }
             }
             continue;
         };
