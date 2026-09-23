@@ -1,4 +1,7 @@
 use std::path::Path;
+use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
 
 pub fn meeting_saved(meeting_path: &Path) {
     let body = meeting_path
@@ -20,14 +23,36 @@ pub fn recording_failed(err: &str) {
         .show();
 }
 
-pub fn meeting_detected(app_name: &str) {
+/// The calendar and the mic detector usually both see the same meeting a few
+/// minutes apart (event starts, then you join the call). One nudge is enough.
+const START_REMINDER_DEDUP: Duration = Duration::from_secs(10 * 60);
+static LAST_START_REMINDER: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn start_reminder(summary: &str, body: &str) {
+    let mut last = LAST_START_REMINDER.lock();
+    if last.is_some_and(|t| t.elapsed() < START_REMINDER_DEDUP) {
+        return;
+    }
+    *last = Some(Instant::now());
     let _ = notify_rust::Notification::new()
-        .summary("¿Reunión en curso?")
-        .body(&format!(
-            "{app_name} está usando el micrófono. Click en STT en la menubar → Empezar reunión."
-        ))
+        .summary(summary)
+        .body(body)
         .appname("stt-md")
         .show();
+}
+
+pub fn meeting_detected(app_name: &str) {
+    start_reminder(
+        "¿Reunión en curso?",
+        &format!("{app_name} está usando el micrófono. Click en STT en la menubar → Empezar reunión."),
+    );
+}
+
+pub fn calendar_meeting_starting(title: &str) {
+    start_reminder(
+        "¿Grabo la reunión?",
+        &format!("«{title}» empieza ahora. Click en STT en la menubar → Empezar reunión."),
+    );
 }
 
 pub fn meeting_failed(err: &str) {
