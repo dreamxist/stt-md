@@ -109,7 +109,8 @@ impl MeetingSummary {
 
         if let Some(link) = &self.project_wikilink {
             let cleaned = link.trim_start_matches("[[").trim_end_matches("]]");
-            if !vocab.wikilink_targets.contains(cleaned) {
+            // Daily notes are valid link targets but never a meeting's project.
+            if !vocab.wikilink_targets.contains(cleaned) || is_valid_iso_date(cleaned) {
                 self.project_wikilink = None;
             }
         }
@@ -272,6 +273,19 @@ mod tests {
         s.enforce_vocab(&v);
         assert_eq!(s.tags, vec!["acme", "Roadmap", "meeting"]);
         assert_eq!(s.project_wikilink, None);
+    }
+
+    #[test]
+    fn enforce_vocab_drops_daily_note_as_project() {
+        let v = vocab(&[], &[], &["acme", "2026-09-03"]);
+        let mut s = summary();
+        s.project_wikilink = Some("[[2026-09-03]]".into());
+        s.enforce_vocab(&v);
+        assert_eq!(s.project_wikilink, None);
+
+        s.project_wikilink = Some("[[acme]]".into());
+        s.enforce_vocab(&v);
+        assert_eq!(s.project_wikilink.as_deref(), Some("[[acme]]"));
     }
 
     #[test]
