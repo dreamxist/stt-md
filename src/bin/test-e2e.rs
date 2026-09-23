@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use chrono::Local;
-use std::path::PathBuf;
+use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use stt_md::{audio_utils, config::Config, llm, transcription::whisper::WhisperEngine, vault};
@@ -111,8 +111,8 @@ fn main() -> Result<()> {
     let t0 = Instant::now();
     let raw = llm::ollama::generate_json(
         &prompt,
-        llm::ollama::DEFAULT_MODEL,
-        llm::ollama::DEFAULT_URL,
+        &cfg.ollama_model,
+        &cfg.ollama_url,
     )?;
     println!("[4/5] ollama returned in {}ms", t0.elapsed().as_millis());
 
@@ -128,7 +128,9 @@ fn main() -> Result<()> {
     println!("      decisions: {}", summary.decisions.len());
     println!("      action_items: {}", summary.action_items.len());
 
-    let started_at = Local::now();
+    // Reprocessing an old recording should land in its original week and
+    // daily note, so take the start time from the `YYYY-MM-DD-HHMMSS` file name.
+    let started_at = started_at_from_file_name(&wav_path).unwrap_or_else(Local::now);
     let longest_track = mic_samples
         .len()
         .max(sys_samples.as_ref().map_or(0, |s| s.len()));
@@ -166,4 +168,11 @@ fn main() -> Result<()> {
 
     println!("\n✓ E2E test complete");
     Ok(())
+}
+
+fn started_at_from_file_name(path: &Path) -> Option<DateTime<Local>> {
+    let name = path.file_name()?.to_str()?;
+    let stamp = name.get(..17)?;
+    let naive = NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d-%H%M%S").ok()?;
+    Local.from_local_datetime(&naive).single()
 }
