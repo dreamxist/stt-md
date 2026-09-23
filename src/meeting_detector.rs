@@ -125,23 +125,23 @@ fn detect_meeting_app(custom: Option<&[String]>) -> Option<String> {
         let Some(bundle) = coreaudio::bundle_id(obj) else {
             continue;
         };
-        let bundle = bundle.to_ascii_lowercase();
-        match custom {
-            Some(list) => {
-                if let Some(p) = list.iter().find(|p| bundle.starts_with(p.as_str())) {
-                    return Some(p.clone());
-                }
-            }
-            None => {
-                if let Some((_, name)) =
-                    DEFAULT_MEETING_APPS.iter().find(|(p, _)| bundle.starts_with(p))
-                {
-                    return Some((*name).to_string());
-                }
-            }
+        if let Some(name) = meeting_app_name(&bundle, custom) {
+            return Some(name);
         }
     }
     None
+}
+
+/// Nombre a mostrar si `bundle` es una app de reuniones de la lista, o `None`.
+fn meeting_app_name(bundle: &str, custom: Option<&[String]>) -> Option<String> {
+    let bundle = bundle.to_ascii_lowercase();
+    match custom {
+        Some(list) => list.iter().find(|p| bundle.starts_with(p.as_str())).cloned(),
+        None => DEFAULT_MEETING_APPS
+            .iter()
+            .find(|(p, _)| bundle.starts_with(p))
+            .map(|(_, name)| (*name).to_string()),
+    }
 }
 
 /// FFI mínima a CoreAudio para los process objects (AudioHardware.h, macOS 14+).
@@ -312,6 +312,21 @@ mod tests {
         }
         let detected = detect_meeting_app(None);
         println!("meeting app detected: {detected:?}");
+    }
+
+    #[test]
+    fn dictation_apps_never_count_as_meetings() {
+        assert_eq!(meeting_app_name("com.superduper.superwhisper", None), None);
+        assert_eq!(meeting_app_name("com.apple.speech.speechsynthesisd", None), None);
+    }
+
+    #[test]
+    fn meeting_apps_match_including_helpers() {
+        assert_eq!(meeting_app_name("us.zoom.xos", None).as_deref(), Some("Zoom"));
+        assert_eq!(
+            meeting_app_name("com.google.Chrome.helper", None).as_deref(),
+            Some("Chrome")
+        );
     }
 
     #[test]
