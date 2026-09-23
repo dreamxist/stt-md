@@ -1,5 +1,5 @@
 use stt_md::{
-    app_state, audio_utils, config, llm, meeting_detector, notifications, recording, sounds,
+    app_state, audio_utils, calendar_reminder, config, llm, meeting_detector, notifications, recording, sounds,
     transcription, vault,
 };
 
@@ -113,6 +113,7 @@ fn run() -> anyhow::Result<()> {
 
     if cfg.meeting_reminder {
         meeting_detector::spawn(state.clone(), cfg.meeting_reminder_apps.clone());
+        calendar_reminder::spawn(state.clone());
     }
 
     let (proc_tx, proc_rx): (Sender<ProcessingMsg>, Receiver<ProcessingMsg>) = unbounded();

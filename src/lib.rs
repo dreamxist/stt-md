@@ -1,5 +1,6 @@
 pub mod app_state;
 pub mod audio_utils;
+pub mod calendar_reminder;
 pub mod config;
 pub mod llm;
 pub mod meeting_detector;

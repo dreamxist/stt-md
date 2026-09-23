@@ -41,6 +41,10 @@ walkdir = "2"
 notify-rust = "4"
 toml = "0.8"
 anyhow = "1"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSDate", "NSError", "NSPredicate", "NSString", "NSURL"] }
+block2 = "0.6"
+objc2-event-kit = { version = "0.3", default-features = false, features = ["std", "block2", "EKEventStore", "EKEvent", "EKCalendar", "EKCalendarItem", "EKObject", "EKParticipant", "EKTypes"] }
 
 [profile.release]
 opt-level = 3
