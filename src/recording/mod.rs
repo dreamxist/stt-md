@@ -4,7 +4,7 @@ pub mod wav_writer;
 
 use anyhow::{anyhow, Result};
 use chrono::Local;
-use crossbeam_channel::unbounded;
+use crossbeam_channel::{unbounded, Sender};
 use serde::{Deserialize, Serialize};
 use parking_lot::Mutex;
 use std::path::PathBuf;
@@ -14,7 +14,20 @@ use std::time::{Duration, Instant};
 
 use crate::paths;
 use mic::MicCapture;
-use system_audio::{SystemAudioCapture, SYSTEM_AUDIO_CHANNELS, SYSTEM_AUDIO_SAMPLE_RATE};
+use system_audio::{
+    new_last_audio, LastAudio, SystemAudioCapture, SYSTEM_AUDIO_CHANNELS, SYSTEM_AUDIO_SAMPLE_RATE,
+};
+
+/// How long the system tap may deliver nothing but digital silence, while the
+/// mic still hears someone, before we call it dead and restart it. A phone
+/// call taking over the audio session killed a 31-minute meeting at 14:41 and
+/// the other side's half was never recorded. Long enough that a real pause in
+/// the call can't look like a failure.
+pub const SYSTEM_AUDIO_STALL: Duration = Duration::from_secs(90);
+
+/// Each restart costs a fraction of a second of audio, so a tap that keeps
+/// dying is a problem to report, not to keep papering over.
+const MAX_SYSTEM_RESTARTS: u32 = 5;
 use wav_writer::{LastVoice, WavSink};
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -31,6 +44,8 @@ pub enum AudioSource {
 pub struct RecordingOutput {
     pub mic_path: PathBuf,
     pub sys_path: Option<PathBuf>,
+    /// Times the system tap died and had to be revived mid-recording.
+    pub sys_restarts: u32,
 }
 
 pub struct RecordingSession {
@@ -41,6 +56,10 @@ pub struct RecordingSession {
     mic_wav: WavSink,
     sys_wav: Option<WavSink>,
     last_voice: LastVoice,
+    /// Kept alive so a restarted tap writes into the same WAV as the dead one.
+    sys_tx: Option<Sender<Vec<f32>>>,
+    sys_last_audio: Option<LastAudio>,
+    sys_restarts: u32,
 }
 
 impl RecordingSession {
@@ -78,6 +97,9 @@ impl RecordingSession {
             mic_wav,
             sys_wav: None,
             last_voice,
+            sys_tx: None,
+            sys_last_audio: None,
+            sys_restarts: 0,
         })
     }
 
@@ -90,7 +112,8 @@ impl RecordingSession {
         let (sys_tx, sys_rx) = unbounded::<Vec<f32>>();
 
         let mic = MicCapture::start(mic_tx)?;
-        let system = SystemAudioCapture::start(sys_tx)?;
+        let sys_last_audio = new_last_audio();
+        let system = SystemAudioCapture::start(sys_tx.clone(), sys_last_audio.clone())?;
 
         let base = timestamp_base();
         let mic_path = paths::recordings_dir().join(format!("{base}-mic.wav"));
@@ -120,6 +143,9 @@ impl RecordingSession {
             mic_wav,
             sys_wav: Some(sys_wav),
             last_voice,
+            sys_tx: Some(sys_tx),
+            sys_last_audio: Some(sys_last_audio),
+            sys_restarts: 0,
         })
     }
 
@@ -128,10 +154,50 @@ impl RecordingSession {
         self.last_voice.lock().elapsed()
     }
 
+    /// Whether the system tap went dead while the meeting is still going.
+    ///
+    /// Both halves matter: digital silence on its own is what a call on hold
+    /// looks like, and a quiet stretch on its own is just nobody talking. Only
+    /// the pair — someone speaking into the mic while the tap hands us exact
+    /// zeros — means the audio we are supposed to be recording is gone.
+    pub fn system_audio_stalled(&self) -> bool {
+        if self.sys_restarts >= MAX_SYSTEM_RESTARTS {
+            return false;
+        }
+        let tap_dead = self
+            .sys_last_audio
+            .as_ref()
+            .is_some_and(|l| l.lock().elapsed() >= SYSTEM_AUDIO_STALL);
+        tap_dead && self.silent_for() < SYSTEM_AUDIO_STALL
+    }
+
+    /// Tears the dead SCStream down and opens a new one onto the same channel,
+    /// so the WAV writer keeps appending to the file it already has. The gap is
+    /// whatever SCK takes to hand over, well under a second.
+    pub fn restart_system_audio(&mut self) -> Result<u32> {
+        let (Some(tx), Some(last_audio)) = (self.sys_tx.clone(), self.sys_last_audio.clone())
+        else {
+            return Err(anyhow!("esta sesión no está capturando audio del sistema"));
+        };
+        self.sys_restarts += 1;
+        // Drop first: two taps on the same display fight over the audio unit.
+        self.system = None;
+        *last_audio.lock() = Instant::now();
+        self.system = Some(SystemAudioCapture::start(tx, last_audio)?);
+        Ok(self.sys_restarts)
+    }
+
+    /// How many times the tap had to be revived. Surfaces in the note so a
+    /// transcript stitched across a dropout is never read as a clean one.
+    pub fn system_restarts(&self) -> u32 {
+        self.sys_restarts
+    }
+
     pub fn stop(self) -> Result<RecordingOutput> {
         let output = RecordingOutput {
             mic_path: self.mic_wav.path.clone(),
             sys_path: self.sys_wav.as_ref().map(|w| w.path.clone()),
+            sys_restarts: self.sys_restarts,
         };
 
         // Drop mic and system streams first so their senders close; each WAV

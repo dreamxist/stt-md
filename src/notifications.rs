@@ -96,3 +96,19 @@ pub fn recording_silent(minutes: u64) {
         .appname("stt-md")
         .show();
 }
+
+pub fn system_audio_restarted() {
+    let _ = notify_rust::Notification::new()
+        .summary("Se cayó el audio del sistema")
+        .body("La otra voz dejó de llegar y stt-md reinició la captura. Revisa que la reunión siga sonando por el parlante.")
+        .appname("stt-md")
+        .show();
+}
+
+pub fn system_audio_lost() {
+    let _ = notify_rust::Notification::new()
+        .summary("Se perdió el audio del sistema")
+        .body("No se pudo recuperar la captura: desde aquí solo queda tu micrófono. Detén y vuelve a grabar si necesitas la otra voz.")
+        .appname("stt-md")
+        .show();
+}

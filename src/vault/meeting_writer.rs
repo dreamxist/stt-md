@@ -14,6 +14,15 @@ pub struct WrittenMeeting {
     pub stem: String,
 }
 
+/// Where a meeting's tracks live and whether one of them let us down.
+pub struct AudioContext<'a> {
+    pub mic_path: &'a Path,
+    pub sys_path: Option<&'a Path>,
+    /// Set when a track dropped out, so the note can say so before anyone
+    /// reads a summary drawn from half the audio.
+    pub warning: Option<&'a str>,
+}
+
 pub fn write_meeting(
     vault_root: &Path,
     meetings_dir_rel: &str,
@@ -21,9 +30,13 @@ pub fn write_meeting(
     summary: &MeetingSummary,
     segments: &[TranscriptSegment],
     duration_min: i64,
-    audio_path: &Path,
-    audio_sys_path: Option<&Path>,
+    audio: &AudioContext<'_>,
 ) -> Result<WrittenMeeting> {
+    let AudioContext {
+        mic_path: audio_path,
+        sys_path: audio_sys_path,
+        warning: audio_warning,
+    } = *audio;
     let slug = slugify(&summary.title);
     let meetings_dir = vault_root.join(meetings_dir_rel);
     fs::create_dir_all(&meetings_dir)?;
@@ -58,11 +71,20 @@ pub fn write_meeting(
     if let Some(sys_name) = audio_sys_path.and_then(|p| p.file_name()) {
         body.push_str(&format!("audio_sys: {}\n", sys_name.to_string_lossy()));
     }
+    if let Some(warning) = audio_warning {
+        body.push_str(&format!("audio_warning: {}\n", yaml_quote(warning)));
+    }
     body.push_str("type: meeting\n");
     body.push_str("source: stt-md\n");
     body.push_str("---\n\n");
 
     body.push_str(&format!("# {}\n\n", summary.title));
+
+    // Above the summary on purpose: a note built on half the audio has to say
+    // so before anyone reads conclusions drawn from it.
+    if let Some(warning) = audio_warning {
+        body.push_str(&format!("> ⚠️ {warning}\n\n"));
+    }
 
     body.push_str("## Resumen\n\n");
     body.push_str(summary.summary_md.trim());

@@ -162,6 +162,25 @@ fn run() -> anyhow::Result<()> {
             && session.lock().as_ref().is_some_and(|(_, started)| {
                 Local::now() - *started >= chrono::Duration::hours(MAX_RECORDING_HOURS)
             });
+        // A dead system tap is invisible from the outside: the timer keeps
+        // running and the WAV keeps growing, only full of zeros. Revive it
+        // while the meeting is still happening — afterwards there is nothing
+        // to recover.
+        if let Some((s, _)) = session.lock().as_mut()
+            && s.system_audio_stalled()
+        {
+            match s.restart_system_audio() {
+                Ok(n) => {
+                    println!("[stt-md] system audio went silent; restarted tap (attempt {n})");
+                    notifications::system_audio_restarted();
+                }
+                Err(e) => {
+                    eprintln!("[stt-md] could not restart system audio: {e:?}");
+                    notifications::system_audio_lost();
+                }
+            }
+        }
+
         // Nudge once per quiet stretch; talking again re-arms the reminder.
         if let Some((s, _)) = session.lock().as_ref() {
             let quiet = s.silent_for() >= SILENCE_REMINDER;
@@ -410,7 +429,28 @@ fn process_recording(
         _ => mic_segments,
     };
 
-    let transcript_text: String = segments.iter().map(format_transcript_line).collect();
+    // A tap that died mid-meeting leaves the note looking like a monologue.
+    // Say it out loud — in the note and to the summarizer — instead of letting
+    // a model fill the gap with people and deadlines nobody mentioned.
+    let audio_warning = sys_samples
+        .as_ref()
+        .and_then(|s| audio_utils::dead_air(s, 16_000))
+        .map(|(at, run)| {
+            println!(
+                "[stt-md] system track flatlined at {:.0}s for {:.0}s",
+                at, run
+            );
+            format!(
+                "El audio del sistema se cortó en {:02}:{:02} y no volvió: desde ahí solo hay micrófono,                  la otra voz falta o aparece atribuida a «yo», y el resumen cubre nada más que la primera parte.",
+                (at as u64) / 60,
+                (at as u64) % 60
+            )
+        });
+
+    let mut transcript_text: String = segments.iter().map(format_transcript_line).collect();
+    if let Some(warning) = &audio_warning {
+        transcript_text.insert_str(0, &format!("[aviso del grabador: {warning}]\n\n"));
+    }
 
     match cfg.output_mode {
         OutputMode::Obsidian => process_obsidian_mode(
@@ -420,6 +460,7 @@ fn process_recording(
             duration_min,
             &segments,
             &transcript_text,
+            audio_warning.as_deref(),
         ),
         OutputMode::Simple => process_simple_mode(
             cfg,
@@ -448,6 +489,7 @@ fn process_obsidian_mode(
     duration_min: i64,
     segments: &[transcription::TranscriptSegment],
     transcript_text: &str,
+    audio_warning: Option<&str>,
 ) -> anyhow::Result<PathBuf> {
     let vault_root = cfg.vault_root.as_path();
 
@@ -495,8 +537,11 @@ fn process_obsidian_mode(
         &summary,
         segments,
         duration_min,
-        &recording.mic_path,
-        recording.sys_path.as_deref(),
+        &vault::meeting_writer::AudioContext {
+            mic_path: &recording.mic_path,
+            sys_path: recording.sys_path.as_deref(),
+            warning: audio_warning,
+        },
     )?;
     println!("[stt-md] wrote meeting to {}", written.absolute_path.display());
 

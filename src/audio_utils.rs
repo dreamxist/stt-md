@@ -36,6 +36,38 @@ pub fn load_wav_mono_f32(path: &Path) -> Result<(Vec<f32>, u32)> {
     Ok((mono, sample_rate))
 }
 
+/// The longest stretch of exact digital silence in a track: where it starts
+/// and how long it runs, in seconds. `None` when nothing flatlines for a
+/// minute or more.
+///
+/// A system tap that dies keeps handing the recorder buffers of exact zeros,
+/// so the WAV ends up the right length and only the transcript reveals that
+/// half the meeting is missing a voice. Live audio never holds exact zeros for
+/// minutes: whatever is playing carries a noise floor. Measured as the longest
+/// run rather than the tail because a tap that gets revived mid-meeting leaves
+/// its gap in the middle, and because a stray sound at the end is enough to
+/// hide a dropout that lasted twenty minutes.
+pub fn dead_air(samples: &[f32], sample_rate: u32) -> Option<(f32, f32)> {
+    let min_run = sample_rate as usize * 60;
+    let (mut best_start, mut best_len) = (0usize, 0usize);
+    let mut run_start = 0usize;
+    for (i, s) in samples.iter().enumerate() {
+        if *s != 0.0 {
+            if i - run_start > best_len {
+                best_len = i - run_start;
+                best_start = run_start;
+            }
+            run_start = i + 1;
+        }
+    }
+    if samples.len() - run_start > best_len {
+        best_len = samples.len() - run_start;
+        best_start = run_start;
+    }
+    let rate = sample_rate as f32;
+    (best_len >= min_run).then(|| (best_start as f32 / rate, best_len as f32 / rate))
+}
+
 /// Linear interpolation resample to 16kHz. Adequate for the speech band that
 /// Whisper consumes; a windowed-sinc resampler would only matter for music.
 pub fn resample_to_16k(samples: &[f32], from_rate: u32) -> Vec<f32> {
@@ -61,6 +93,31 @@ pub fn resample_to_16k(samples: &[f32], from_rate: u32) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tone(secs: usize, rate: u32) -> Vec<f32> {
+        (0..secs * rate as usize).map(|i| ((i % 97) as f32 / 97.0) - 0.5).collect()
+    }
+
+    #[test]
+    fn dead_air_finds_a_tap_that_died_mid_meeting() {
+        // 60 s of call, 20 min of zeros, then a stray sound at the very end:
+        // the shape of the meeting that lost half of the other voice.
+        let mut samples = tone(60, 16_000);
+        samples.extend(std::iter::repeat_n(0.0, 16_000 * 60 * 20));
+        samples.extend(tone(1, 16_000));
+        let (at, run) = dead_air(&samples, 16_000).expect("a 20-minute hole is dead air");
+        assert!((at - 60.0).abs() < 1.0, "starts where the audio stopped: {at}");
+        assert!((run - 1200.0).abs() < 1.0, "runs until audio returns: {run}");
+    }
+
+    #[test]
+    fn dead_air_ignores_ordinary_pauses() {
+        let mut samples = tone(60, 16_000);
+        samples.extend(std::iter::repeat_n(0.0, 16_000 * 30));
+        samples.extend(tone(60, 16_000));
+        assert_eq!(dead_air(&samples, 16_000), None);
+    }
+
 
     #[test]
     fn resample_identity_at_16k() {

@@ -1,10 +1,26 @@
 use anyhow::{Context, Result};
 use crossbeam_channel::Sender;
+use parking_lot::Mutex;
 use screencapturekit::prelude::*;
 use screencapturekit::stream::configuration::audio::{AudioChannelCount, AudioSampleRate};
+use std::sync::Arc;
+use std::time::Instant;
 
 pub const SYSTEM_AUDIO_SAMPLE_RATE: u32 = 48_000;
 pub const SYSTEM_AUDIO_CHANNELS: u16 = 1;
+
+/// When the tap last delivered a sample that wasn't digital silence.
+///
+/// A tap that dies mid-meeting keeps handing us buffers, only full of exact
+/// zeros, so the WAV grows at the right rate and nothing looks wrong until the
+/// transcript comes out half empty. A live tap never does that: whatever is
+/// playing carries a noise floor. Exact zeros for minutes means the tap is
+/// dead, not that the room went quiet.
+pub type LastAudio = Arc<Mutex<Instant>>;
+
+pub fn new_last_audio() -> LastAudio {
+    Arc::new(Mutex::new(Instant::now()))
+}
 
 pub struct SystemAudioCapture {
     stream: SCStream,
@@ -14,6 +30,7 @@ unsafe impl Send for SystemAudioCapture {}
 
 struct AudioHandler {
     tx: Sender<Vec<f32>>,
+    last_audio: LastAudio,
 }
 
 impl SCStreamOutputTrait for AudioHandler {
@@ -33,6 +50,9 @@ impl SCStreamOutputTrait for AudioHandler {
                 samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
             }
         }
+        if samples.iter().any(|s| *s != 0.0) {
+            *self.last_audio.lock() = Instant::now();
+        }
         if !samples.is_empty() {
             let _ = self.tx.send(samples);
         }
@@ -40,7 +60,7 @@ impl SCStreamOutputTrait for AudioHandler {
 }
 
 impl SystemAudioCapture {
-    pub fn start(audio_tx: Sender<Vec<f32>>) -> Result<Self> {
+    pub fn start(audio_tx: Sender<Vec<f32>>, last_audio: LastAudio) -> Result<Self> {
         let content = SCShareableContent::get().context(
             "no se pudo enumerar contenido (permiso de Screen Recording denegado en System Settings → Privacy)",
         )?;
@@ -68,7 +88,13 @@ impl SystemAudioCapture {
             .with_excludes_current_process_audio(true);
 
         let mut stream = SCStream::new(&filter, &config);
-        stream.add_output_handler(AudioHandler { tx: audio_tx }, SCStreamOutputType::Audio);
+        stream.add_output_handler(
+            AudioHandler {
+                tx: audio_tx,
+                last_audio,
+            },
+            SCStreamOutputType::Audio,
+        );
         stream
             .start_capture()
             .context("no se pudo iniciar SCStream (permiso denegado o macOS <13)")?;

@@ -67,6 +67,7 @@ impl WhisperEngine {
                 let Some(text) = strip_prompt_leak(raw.trim(), prompt) else {
                     continue;
                 };
+                let text = strip_speaker_label(&text).to_string();
                 if is_known_hallucination(&text) {
                     eprintln!("[stt-md] dropped hallucinated segment: {text}");
                     continue;
@@ -165,6 +166,45 @@ fn is_known_hallucination(text: &str) -> bool {
     bracketed || PHRASES.contains(&t.as_str())
 }
 
+/// How much of `phrase` is echoed at the start of `text`, in bytes.
+///
+/// An exact prefix match misses the leak often enough to matter: a 31-minute
+/// meeting came back with "Vocabulario comú, dígame, dígame" scattered through
+/// it because the prompt says "común" and the decode ate the n, so the strip
+/// below never fired. Accept a prefix that covers nearly all of the phrase and
+/// let it end mid-word; twelve literal characters of overlap with the prompt
+/// is already far more than ordinary Spanish produces by accident.
+fn leaked_prefix_len(text: &str, phrase: &str) -> Option<usize> {
+    let mut text_chars = text.char_indices();
+    let mut phrase_chars = phrase.chars();
+    let mut matched_bytes = 0;
+    let mut matched_chars = 0;
+    while let (Some((i, t)), Some(p)) = (text_chars.next(), phrase_chars.next()) {
+        if !t.to_lowercase().eq(p.to_lowercase()) {
+            break;
+        }
+        matched_bytes = i + t.len_utf8();
+        matched_chars += 1;
+    }
+    let phrase_len = phrase.chars().count();
+    (matched_chars >= 12 && matched_chars * 10 >= phrase_len * 9).then_some(matched_bytes)
+}
+
+/// Whether what survived a prompt leak is worth keeping.
+///
+/// Only ever asked about the tail of a decode that already echoed the prompt,
+/// so the bar is high: by then the window has gone off the rails, and a couple
+/// of words of filler ("dígame, dígame") say less than they cost to read. Real
+/// speech that happens to repeat itself never reaches here.
+fn is_leak_residue(text: &str) -> bool {
+    let words: Vec<String> = text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    words.len() < 3 || words.windows(2).all(|w| w[0] == w[1])
+}
+
 /// whisper.cpp sometimes echoes the initial prompt back as if it had been
 /// spoken ("Vocabulario común: …"). Strips a leading prompt phrase from the
 /// segment and drops segments that are nothing but prompt text.
@@ -176,14 +216,38 @@ fn strip_prompt_leak(text: &str, prompt: &str) -> Option<String> {
     }
     let mut rest = text;
     for phrase in prompt.split(['.', ':']).map(str::trim).filter(|p| p.len() >= 8) {
-        if rest.to_lowercase().starts_with(&phrase.to_lowercase())
-            && let Some(tail) = rest.get(phrase.len()..)
-        {
-            rest = tail.trim_start_matches([':', '.', ',', ' ']);
+        if let Some(len) = leaked_prefix_len(rest, phrase) {
+            rest = rest[len..].trim_start_matches([':', '.', ',', ' ']);
         }
     }
+    let leaked = rest.len() != text.len();
     let rest = rest.trim();
-    (!rest.is_empty()).then(|| rest.to_string())
+    if rest.is_empty() || (leaked && is_leak_residue(rest)) {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
+/// Drops the subtitle-style speaker label whisper.cpp invents from the audio
+/// ("Luis García: te cacho, es interesante"). The name rides into the note's
+/// `people`, which is how a meeting between two people came back listing three
+/// strangers. Both tracks already know who is talking, so a label is noise.
+fn strip_speaker_label(text: &str) -> &str {
+    let Some((head, tail)) = text.split_once(": ") else {
+        return text;
+    };
+    let words: Vec<&str> = head.split_whitespace().collect();
+    let looks_like_name = (2..=3).contains(&words.len())
+        && head.len() <= 32
+        && words.iter().all(|w| {
+            let mut chars = w.chars();
+            chars.next().is_some_and(char::is_uppercase) && chars.all(|c| !c.is_uppercase())
+        });
+    if looks_like_name {
+        tail.trim_start()
+    } else {
+        text
+    }
 }
 
 fn num_cpus_for_whisper() -> std::os::raw::c_int {
@@ -240,6 +304,47 @@ mod tests {
 
     fn texts(segments: &[TranscriptSegment]) -> Vec<&str> {
         segments.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    const PROMPT: &str = "Reunión técnica de software en español chileno. \
+        Vocabulario común: whisper, Ollama, Obsidian, vault, prompt, LLM.";
+
+    #[test]
+    fn strips_prompt_leak_even_when_whisper_drops_a_letter() {
+        // The decode that cost half a meeting: "común" came back as "comú".
+        assert_eq!(strip_prompt_leak("Vocabulario comú: sí, con el hijo", PROMPT), Some("sí, con el hijo".to_string()));
+    }
+
+    #[test]
+    fn drops_a_leak_that_leaves_nothing_but_filler() {
+        for junk in [
+            "Vocabulario comú, dígame, dígame, dígame.",
+            "Vocabulario comú, dígame, dígame.",
+            "Vocabulario comú, dígame.",
+        ] {
+            assert_eq!(strip_prompt_leak(junk, PROMPT), None, "{junk}");
+        }
+    }
+
+    #[test]
+    fn keeps_speech_that_merely_shares_a_word_with_the_prompt() {
+        let text = "Vocabulario aparte, el agente tiene que validar la receta";
+        assert_eq!(strip_prompt_leak(text, PROMPT), Some(text.to_string()));
+        assert_eq!(strip_prompt_leak("prompt de entrada", PROMPT), Some("prompt de entrada".to_string()));
+    }
+
+    #[test]
+    fn strips_invented_speaker_labels() {
+        assert_eq!(strip_speaker_label("Luis García: te cacho, es interesante"), "te cacho, es interesante");
+        assert_eq!(strip_speaker_label("José Ballestero: ya"), "ya");
+    }
+
+    #[test]
+    fn keeps_a_colon_that_is_not_a_speaker_label() {
+        let quoted = "Le decimos: mira, ocupa esta plataforma";
+        assert_eq!(strip_speaker_label(quoted), quoted);
+        let listing = "Tenemos tres canales: WhatsApp, Instagram y TikTok";
+        assert_eq!(strip_speaker_label(listing), listing);
     }
 
     #[test]

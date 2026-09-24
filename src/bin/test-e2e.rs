@@ -150,8 +150,11 @@ fn main() -> Result<()> {
         &summary,
         &segments,
         duration_min,
-        &wav_path,
-        sys_wav_path.as_deref(),
+        &stt_md::vault::meeting_writer::AudioContext {
+            mic_path: &wav_path,
+            sys_path: sys_wav_path.as_deref(),
+            warning: None,
+        },
     )?;
     println!("[5/5] wrote meeting → {}", written.absolute_path.display());
 
