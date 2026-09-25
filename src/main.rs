@@ -124,6 +124,7 @@ fn run() -> anyhow::Result<()> {
     // (see the proc_rx handler below).
     let mut last_tick = Instant::now() - Duration::from_secs(2);
     let mut silence_notified = false;
+    let mut remote_missing_notified = false;
 
     event_loop.run(move |_event, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(250));
@@ -179,6 +180,19 @@ fn run() -> anyhow::Result<()> {
                     notifications::system_audio_lost();
                 }
             }
+        }
+
+        // Nothing is playing and the user keeps talking: the other side is not
+        // reaching the output at all, so there is nothing to restart and the
+        // only thing that helps is saying so before the meeting ends.
+        if let Some((s, _)) = session.lock().as_ref() {
+            let missing = s.system_audio_missing();
+            if missing && !remote_missing_notified {
+                let mins = recording::SYSTEM_AUDIO_MISSING.as_secs() / 60;
+                println!("[stt-md] nothing on the output for {mins} min while the mic hears voice");
+                notifications::remote_voice_missing(mins);
+            }
+            remote_missing_notified = missing;
         }
 
         // Nudge once per quiet stretch; talking again re-arms the reminder.

@@ -132,6 +132,21 @@ fn detect_meeting_app(custom: Option<&[String]>) -> Option<String> {
     None
 }
 
+/// Whether some other process is feeding the output right now.
+///
+/// This is what tells a dead system-audio tap apart from an ordinary quiet
+/// stretch. Both hand the recorder exact zeros — the assumption that a live tap
+/// always carries a noise floor holds for a call, which sends comfort noise,
+/// but not for a Mac with nothing playing. Asking the HAL who is actually
+/// playing removes the guesswork: zeros while something plays means the tap is
+/// gone; zeros while nothing plays means nothing is happening.
+pub fn output_is_playing() -> bool {
+    let own_pid = std::process::id() as i32;
+    coreaudio::process_objects().into_iter().any(|obj| {
+        coreaudio::is_running_output(obj) && coreaudio::pid(obj) != Some(own_pid)
+    })
+}
+
 /// Nombre a mostrar si `bundle` es una app de reuniones de la lista, o `None`.
 fn meeting_app_name(bundle: &str, custom: Option<&[String]>) -> Option<String> {
     let bundle = bundle.to_ascii_lowercase();
@@ -163,6 +178,7 @@ mod coreaudio {
     const PROCESS_PID: u32 = fourcc(b"ppid"); // kAudioProcessPropertyPID
     const PROCESS_BUNDLE_ID: u32 = fourcc(b"pbid"); // kAudioProcessPropertyBundleID
     const PROCESS_IS_RUNNING_INPUT: u32 = fourcc(b"piri"); // kAudioProcessPropertyIsRunningInput
+    const PROCESS_IS_RUNNING_OUTPUT: u32 = fourcc(b"piro"); // kAudioProcessPropertyIsRunningOutput
 
     const fn fourcc(b: &[u8; 4]) -> u32 {
         u32::from_be_bytes(*b)
@@ -228,7 +244,15 @@ mod coreaudio {
     }
 
     pub fn is_running_input(obj: u32) -> bool {
-        let address = addr(PROCESS_IS_RUNNING_INPUT);
+        running(obj, PROCESS_IS_RUNNING_INPUT)
+    }
+
+    pub fn is_running_output(obj: u32) -> bool {
+        running(obj, PROCESS_IS_RUNNING_OUTPUT)
+    }
+
+    fn running(obj: u32, selector: u32) -> bool {
+        let address = addr(selector);
         let mut value: u32 = 0;
         let mut size = size_of::<u32>() as u32;
         let status = unsafe {

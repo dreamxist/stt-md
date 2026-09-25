@@ -18,12 +18,22 @@ use system_audio::{
     new_last_audio, LastAudio, SystemAudioCapture, SYSTEM_AUDIO_CHANNELS, SYSTEM_AUDIO_SAMPLE_RATE,
 };
 
-/// How long the system tap may deliver nothing but digital silence, while the
-/// mic still hears someone, before we call it dead and restart it. A phone
-/// call taking over the audio session killed a 31-minute meeting at 14:41 and
-/// the other side's half was never recorded. Long enough that a real pause in
-/// the call can't look like a failure.
+/// How long the tap may hand us nothing but digital silence *while something is
+/// playing* before we call it broken and restart it. With audio on the output
+/// there is no innocent explanation, so this can be short.
 pub const SYSTEM_AUDIO_STALL: Duration = Duration::from_secs(90);
+
+/// How long the output may stay silent while the mic keeps hearing someone
+/// before we tell the user the other side is not arriving.
+///
+/// This is the case that cost a 31-minute meeting: an incoming phone call took
+/// the output away and the remote side stopped reaching the speaker at 14:41 —
+/// which is why the mic never picked him up either. Restarting the tap would
+/// have captured nothing, because there was nothing playing to capture; only a
+/// warning while the meeting was still running could have saved it. Eight
+/// minutes because a meeting where the other side says nothing for that long is
+/// rarer than one that has quietly broken: a real recording went 4,5 minutes.
+pub const SYSTEM_AUDIO_MISSING: Duration = Duration::from_secs(8 * 60);
 
 /// Each restart costs a fraction of a second of audio, so a tap that keeps
 /// dying is a problem to report, not to keep papering over.
@@ -165,19 +175,32 @@ impl RecordingSession {
         self.last_voice.lock().elapsed()
     }
 
-    /// Whether the system tap went dead while the meeting is still going.
+    /// Whether the tap is broken: exact zeros while an app is actually playing.
     ///
-    /// Both halves matter: digital silence on its own is what a call on hold
-    /// looks like, and a quiet stretch on its own is just nobody talking. Only
-    /// the pair — someone speaking into the mic while the tap hands us exact
-    /// zeros — means the audio we are supposed to be recording is gone.
+    /// The mic is no help in deciding this. Both a dead tap and an ordinary
+    /// quiet stretch deliver exact zeros — a real 37-minute recording held 268
+    /// seconds of them with the tap perfectly alive — so keying off "the mic
+    /// hears someone" restarts a healthy stream and burns the retry budget.
+    /// Asking the HAL who is playing is the signal that actually separates them.
     pub fn system_audio_stalled(&self) -> bool {
         let Some(tap) = self.system.as_ref() else {
             return false;
         };
         tap.restarts < MAX_SYSTEM_RESTARTS
             && tap.last_audio.lock().elapsed() >= SYSTEM_AUDIO_STALL
-            && self.silent_for() < SYSTEM_AUDIO_STALL
+            && crate::meeting_detector::output_is_playing()
+    }
+
+    /// Whether the other side has stopped arriving: nothing has played for a
+    /// long while, yet the mic keeps hearing someone talk. Nothing to restart
+    /// here — the audio is not reaching the output at all — so the only useful
+    /// move is telling the user while the meeting can still be saved.
+    pub fn system_audio_missing(&self) -> bool {
+        let Some(tap) = self.system.as_ref() else {
+            return false;
+        };
+        tap.last_audio.lock().elapsed() >= SYSTEM_AUDIO_MISSING
+            && self.silent_for() < Duration::from_secs(60)
     }
 
     /// Tears the dead SCStream down and opens a new one onto the same channel,

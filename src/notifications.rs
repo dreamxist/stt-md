@@ -112,3 +112,13 @@ pub fn system_audio_lost() {
         .appname("stt-md")
         .show();
 }
+
+pub fn remote_voice_missing(minutes: u64) {
+    let _ = notify_rust::Notification::new()
+        .summary("No está llegando la otra voz")
+        .body(&format!(
+            "Llevas {minutes} min hablando sin que suene nada por el parlante. Revisa el audio de la reunión: lo que digan los demás no se está grabando."
+        ))
+        .appname("stt-md")
+        .show();
+}
