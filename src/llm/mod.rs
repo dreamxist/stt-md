@@ -36,7 +36,57 @@ pub struct MeetingSummary {
     pub area: Option<String>,
 }
 
+/// Summarize, retry once, and fall back to a transcript-only note.
+///
+/// Never returns an error on purpose: losing a meeting because a local 7B model
+/// emitted broken JSON is a worse outcome than a note without a summary.
+pub fn summarize_with_fallback(prompt: &str, model: &str, url: &str) -> MeetingSummary {
+    match summarize_once(prompt, model, url) {
+        Ok(s) => s,
+        Err(first) => {
+            eprintln!("[stt-md] summary failed ({first:#}); retrying once");
+            match summarize_once(prompt, model, url) {
+                Ok(s) => s,
+                Err(second) => {
+                    eprintln!("[stt-md] summary failed again: {second:#}");
+                    MeetingSummary::unsummarized(&second.to_string())
+                }
+            }
+        }
+    }
+}
+
+fn summarize_once(prompt: &str, model: &str, url: &str) -> anyhow::Result<MeetingSummary> {
+    let raw = ollama::generate_json(prompt, model, url)?;
+    serde_json::from_str(&raw)
+        .map_err(|e| anyhow::anyhow!("ollama returned invalid JSON: {e}\n--- raw ---\n{raw}"))
+}
+
 impl MeetingSummary {
+    /// What to write when the summarizer fails.
+    ///
+    /// The transcript is the artifact worth keeping; the summary is a
+    /// convenience on top of it. A local 7B model returns broken JSON every so
+    /// often, and a meeting must not disappear over that — it cost one: the
+    /// note was never written, the failure notification was swallowed by
+    /// macOS, and the only trace left was two WAVs nobody knew to reprocess.
+    pub fn unsummarized(reason: &str) -> Self {
+        Self {
+            title: "Reunión sin resumen".to_string(),
+            summary_md: format!(
+                "El resumen automático falló, así que esta nota trae la transcripción sola. \
+                 Motivo: {reason}"
+            ),
+            decisions: Vec::new(),
+            action_items: Vec::new(),
+            people: Vec::new(),
+            tags: Vec::new(),
+            project_wikilink: None,
+            area: None,
+        }
+    }
+
+
     /// Light cleanup for the simple-mode flow (no vault to enforce against).
     /// Just normalizes person names + drops invalid deadline strings, and
     /// caps the LLM's free-form tags to a sane lowercase kebab-case set.
@@ -273,6 +323,15 @@ mod tests {
         s.enforce_vocab(&v);
         assert_eq!(s.tags, vec!["acme", "Roadmap", "meeting"]);
         assert_eq!(s.project_wikilink, None);
+    }
+
+    #[test]
+    fn a_dead_summarizer_still_yields_a_note() {
+        // Port 1 refuses instantly: stands in for ollama down or babbling.
+        let s = summarize_with_fallback("cualquier cosa", "qwen2.5:7b", "http://127.0.0.1:1");
+        assert_eq!(s.title, "Reunión sin resumen");
+        assert!(s.summary_md.contains("transcripción"), "{}", s.summary_md);
+        assert!(s.decisions.is_empty() && s.action_items.is_empty() && s.people.is_empty());
     }
 
     #[test]

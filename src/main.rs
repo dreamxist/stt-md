@@ -1,6 +1,6 @@
 use stt_md::{
-    app_state, audio_utils, calendar_reminder, config, llm, meeting_detector, notifications, recording, sounds,
-    transcription, vault,
+    app_state, audio_utils, calendar_reminder, config, llm, meeting_detector, notifications, paths,
+    recording, sounds, transcription, vault,
 };
 
 use std::path::PathBuf;
@@ -28,7 +28,40 @@ enum ProcessingMsg {
 
 type SessionSlot = Arc<Mutex<Option<(RecordingSession, DateTime<Local>)>>>;
 
+/// Send stdout and stderr to a file when there is no terminal to read them.
+///
+/// Launched from Finder the app has nowhere to print, so every diagnostic it
+/// already writes is discarded — which is how a failed meeting left no trace at
+/// all: the note was never written, the failure notification was swallowed by
+/// macOS because the rebuilt bundle had no permission for it, and the error
+/// itself went to a closed pipe.
+fn redirect_output_to_log() {
+    use std::os::fd::AsRawFd;
+
+    if unsafe { libc::isatty(libc::STDERR_FILENO) } == 1 {
+        return;
+    }
+    let path = paths::log_file();
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    unsafe {
+        libc::dup2(file.as_raw_fd(), libc::STDOUT_FILENO);
+        libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO);
+    }
+    println!(
+        "\n=== stt-md {} arrancó {} ===",
+        env!("CARGO_PKG_VERSION"),
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+    );
+}
+
 fn main() {
+    redirect_output_to_log();
     if let Err(e) = run() {
         let msg = format!("{e:#}");
         eprintln!("[stt-md] fatal: {msg}");
@@ -528,12 +561,12 @@ fn process_obsidian_mode(
         "[stt-md] calling Ollama ({}) — this can take 20-60s…",
         cfg.ollama_model
     );
-    let t0 = Instant::now();
-    let raw = llm::ollama::generate_json(&prompt, &cfg.ollama_model, &cfg.ollama_url)?;
-    println!("[stt-md] ollama replied in {}ms", t0.elapsed().as_millis());
-
-    let mut summary: llm::MeetingSummary = serde_json::from_str(&raw)
-        .map_err(|e| anyhow::anyhow!("ollama returned invalid JSON: {e}\n--- raw ---\n{raw}"))?;
+    // The transcript must survive a bad summary. A 7B model returns broken
+    // JSON often enough that treating the summary as required loses meetings:
+    // one round trip is retried, and if that fails too the note is written
+    // with the transcript and says why it has no summary.
+    let mut summary =
+        llm::summarize_with_fallback(&prompt, &cfg.ollama_model, &cfg.ollama_url);
     summary.enforce_vocab(&vocab);
     summary.enforce_area(&areas);
 

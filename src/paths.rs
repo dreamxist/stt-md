@@ -12,6 +12,10 @@ pub fn recordings_dir() -> PathBuf {
     p
 }
 
+pub fn log_file() -> PathBuf {
+    app_support_dir().join("stt-md.log")
+}
+
 pub fn models_dir() -> PathBuf {
     let p = app_support_dir().join("models");
     let _ = std::fs::create_dir_all(&p);
