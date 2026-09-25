@@ -48,18 +48,27 @@ pub struct RecordingOutput {
     pub sys_restarts: u32,
 }
 
+/// The system-audio tap and everything needed to revive it.
+///
+/// The spare sender lives here on purpose: dropping the tap has to drop it
+/// too, or the WAV writer keeps waiting on a channel nobody will close and
+/// `stop()` hangs joining it. Keeping them in one owner is what makes that
+/// mistake impossible rather than merely documented.
+struct SystemTap {
+    capture: Option<SystemAudioCapture>,
+    tx: Sender<Vec<f32>>,
+    last_audio: LastAudio,
+    restarts: u32,
+}
+
 pub struct RecordingSession {
     pub started_at: Instant,
     pub source: AudioSource,
     mic: MicCapture,
-    system: Option<SystemAudioCapture>,
+    system: Option<SystemTap>,
     mic_wav: WavSink,
     sys_wav: Option<WavSink>,
     last_voice: LastVoice,
-    /// Kept alive so a restarted tap writes into the same WAV as the dead one.
-    sys_tx: Option<Sender<Vec<f32>>>,
-    sys_last_audio: Option<LastAudio>,
-    sys_restarts: u32,
 }
 
 impl RecordingSession {
@@ -97,9 +106,6 @@ impl RecordingSession {
             mic_wav,
             sys_wav: None,
             last_voice,
-            sys_tx: None,
-            sys_last_audio: None,
-            sys_restarts: 0,
         })
     }
 
@@ -113,7 +119,15 @@ impl RecordingSession {
 
         let mic = MicCapture::start(mic_tx)?;
         let sys_last_audio = new_last_audio();
-        let system = SystemAudioCapture::start(sys_tx.clone(), sys_last_audio.clone())?;
+        let system = SystemTap {
+            capture: Some(SystemAudioCapture::start(
+                sys_tx.clone(),
+                sys_last_audio.clone(),
+            )?),
+            tx: sys_tx,
+            last_audio: sys_last_audio,
+            restarts: 0,
+        };
 
         let base = timestamp_base();
         let mic_path = paths::recordings_dir().join(format!("{base}-mic.wav"));
@@ -143,9 +157,6 @@ impl RecordingSession {
             mic_wav,
             sys_wav: Some(sys_wav),
             last_voice,
-            sys_tx: Some(sys_tx),
-            sys_last_audio: Some(sys_last_audio),
-            sys_restarts: 0,
         })
     }
 
@@ -161,47 +172,48 @@ impl RecordingSession {
     /// the pair — someone speaking into the mic while the tap hands us exact
     /// zeros — means the audio we are supposed to be recording is gone.
     pub fn system_audio_stalled(&self) -> bool {
-        if self.sys_restarts >= MAX_SYSTEM_RESTARTS {
+        let Some(tap) = self.system.as_ref() else {
             return false;
-        }
-        let tap_dead = self
-            .sys_last_audio
-            .as_ref()
-            .is_some_and(|l| l.lock().elapsed() >= SYSTEM_AUDIO_STALL);
-        tap_dead && self.silent_for() < SYSTEM_AUDIO_STALL
+        };
+        tap.restarts < MAX_SYSTEM_RESTARTS
+            && tap.last_audio.lock().elapsed() >= SYSTEM_AUDIO_STALL
+            && self.silent_for() < SYSTEM_AUDIO_STALL
     }
 
     /// Tears the dead SCStream down and opens a new one onto the same channel,
     /// so the WAV writer keeps appending to the file it already has. The gap is
     /// whatever SCK takes to hand over, well under a second.
     pub fn restart_system_audio(&mut self) -> Result<u32> {
-        let (Some(tx), Some(last_audio)) = (self.sys_tx.clone(), self.sys_last_audio.clone())
-        else {
+        let Some(tap) = self.system.as_mut() else {
             return Err(anyhow!("esta sesión no está capturando audio del sistema"));
         };
-        self.sys_restarts += 1;
+        tap.restarts += 1;
         // Drop first: two taps on the same display fight over the audio unit.
-        self.system = None;
-        *last_audio.lock() = Instant::now();
-        self.system = Some(SystemAudioCapture::start(tx, last_audio)?);
-        Ok(self.sys_restarts)
+        tap.capture = None;
+        *tap.last_audio.lock() = Instant::now();
+        tap.capture = Some(SystemAudioCapture::start(
+            tap.tx.clone(),
+            tap.last_audio.clone(),
+        )?);
+        Ok(tap.restarts)
     }
 
     /// How many times the tap had to be revived. Surfaces in the note so a
     /// transcript stitched across a dropout is never read as a clean one.
     pub fn system_restarts(&self) -> u32 {
-        self.sys_restarts
+        self.system.as_ref().map_or(0, |t| t.restarts)
     }
 
     pub fn stop(self) -> Result<RecordingOutput> {
         let output = RecordingOutput {
             mic_path: self.mic_wav.path.clone(),
             sys_path: self.sys_wav.as_ref().map(|w| w.path.clone()),
-            sys_restarts: self.sys_restarts,
+            sys_restarts: self.system_restarts(),
         };
 
-        // Drop mic and system streams first so their senders close; each WAV
-        // writer then sees Disconnected, drains, and finalizes its file.
+        // Drop the captures first so every sender closes; each WAV writer then
+        // sees Disconnected, drains and finalizes its file. `SystemTap` owns
+        // the spare sender the watchdog needs, so letting it go releases both.
         drop(self.mic);
         drop(self.system);
 

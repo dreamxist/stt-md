@@ -64,3 +64,46 @@ impl WavSink {
         Ok(Self { path, handle })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam_channel::unbounded;
+    use std::time::Duration;
+
+    /// The writer stops at `Disconnected`, which only happens once *every*
+    /// sender is gone — including spares held elsewhere. The watchdog keeps one
+    /// so a revived tap writes into the same file, and forgetting to drop it
+    /// before `stop()` joins the thread hangs the whole app on Detener.
+    #[test]
+    fn writer_finishes_only_once_every_sender_is_gone() {
+        let dir = std::env::temp_dir().join(format!("stt-md-wavsink-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (tx, rx) = unbounded::<Vec<f32>>();
+        let spare = tx.clone();
+        let last_voice: LastVoice = Arc::new(Mutex::new(Instant::now()));
+        let sink = WavSink::spawn(rx, 16_000, 1, dir.join("t.wav"), last_voice).unwrap();
+
+        tx.send(vec![0.0; 16]).unwrap();
+        drop(tx);
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            !sink.handle.is_finished(),
+            "writer finished while a spare sender was still alive"
+        );
+
+        drop(spare);
+        for _ in 0..100 {
+            if sink.handle.is_finished() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            sink.handle.is_finished(),
+            "writer never finished after the last sender dropped"
+        );
+        sink.handle.join().unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
