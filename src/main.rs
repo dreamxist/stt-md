@@ -60,7 +60,50 @@ fn redirect_output_to_log() {
     );
 }
 
+/// Record, stop and process without touching the menubar.
+///
+/// The permissions this app needs are bound to the signature of the bundle, so
+/// every rebuild asks for them again — and the only way to know they took hold
+/// used to be starting a real meeting by hand and hoping. Running the same
+/// binary from the same bundle exercises the whole path under the identity that
+/// actually holds the grants.
+fn selftest(seconds: u64) -> anyhow::Result<()> {
+    let cfg = Arc::new(Config::load_or_init()?);
+    validate_startup(&cfg)?;
+
+    let (session, used_system) = RecordingSession::start_with_fallback()?;
+    println!(
+        "[selftest] grabando {seconds}s — audio del sistema: {}",
+        if used_system { "sí" } else { "NO (falta el permiso de Grabación de pantalla)" }
+    );
+    let started_at = Local::now();
+    thread::sleep(Duration::from_secs(seconds));
+
+    let output = session.stop()?;
+    println!("[selftest] detenido sin colgarse: {}", output.mic_path.display());
+    if let Some(sys) = &output.sys_path {
+        println!("[selftest] pista del sistema: {}", sys.display());
+    }
+
+    let path = process_recording(&output, started_at, 1, &cfg)?;
+    println!("[selftest] nota escrita: {}", path.display());
+    Ok(())
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--selftest") {
+        let seconds = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(20);
+        match selftest(seconds) {
+            Ok(()) => println!("[selftest] ✓ todo el camino funciona"),
+            Err(e) => {
+                eprintln!("[selftest] ✗ falló: {e:#}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     redirect_output_to_log();
     if let Err(e) = run() {
         let msg = format!("{e:#}");

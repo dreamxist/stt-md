@@ -28,7 +28,7 @@ pub const SYSTEM_AUDIO_STALL: Duration = Duration::from_secs(90);
 ///
 /// This is the case that cost a 31-minute meeting: an incoming phone call took
 /// the output away and the remote side stopped reaching the speaker at 14:41 —
-/// which is why the mic never picked him up either. Restarting the tap would
+/// which is why the mic never picked it up either. Restarting the tap would
 /// have captured nothing, because there was nothing playing to capture; only a
 /// warning while the meeting was still running could have saved it. Eight
 /// minutes because a meeting where the other side says nothing for that long is
