@@ -145,7 +145,30 @@ fn push_clean_tag(out: &mut Vec<String>, raw: &str) {
     out.push(cleaned.to_string());
 }
 
+/// Inline `#tags` in prose, skipping code. Hex colors in CSS snippets and
+/// `#id` selectors inside fenced or backticked code used to land in the
+/// closed vocabulary, and the summarizer then tagged meetings `dc2626` and
+/// `fff`. A tag also has to start a word: `color:#fff` or `(#id)` is not one.
 fn extract_inline_tags(content: &str) -> Vec<String> {
+    let mut prose = String::with_capacity(content.len());
+    let mut in_fence = false;
+    for line in content.lines() {
+        if line.trim_start().starts_with("```") || line.trim_start().starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        for (k, part) in line.split('`').enumerate() {
+            if k % 2 == 0 {
+                prose.push_str(part);
+            }
+            prose.push(' ');
+        }
+        prose.push('\n');
+    }
+    let content = prose.as_str();
     let mut out = Vec::new();
     let bytes = content.as_bytes();
     let mut i = 0;
@@ -153,7 +176,7 @@ fn extract_inline_tags(content: &str) -> Vec<String> {
         if bytes[i] == b'#' {
             if i > 0 {
                 let prev = bytes[i - 1];
-                if prev.is_ascii_alphanumeric() {
+                if !prev.is_ascii_whitespace() {
                     i += 1;
                     continue;
                 }
@@ -176,6 +199,7 @@ fn extract_inline_tags(content: &str) -> Vec<String> {
                     .map(|c| c.is_ascii_lowercase())
                     .unwrap_or(false)
                     && tag.chars().any(|c| c.is_alphabetic())
+                    && !is_hex_color(tag)
                 {
                     out.push(tag.to_string());
                 }
@@ -186,6 +210,10 @@ fn extract_inline_tags(content: &str) -> Vec<String> {
         }
     }
     out
+}
+
+fn is_hex_color(tag: &str) -> bool {
+    matches!(tag.len(), 3 | 6 | 8) && tag.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -216,6 +244,12 @@ mod tests {
     fn inline_tags_basic() {
         let tags = extract_inline_tags("hola #standup y #proyecto-x pero no#esto ni #123 ni # solo");
         assert_eq!(tags, vec!["standup", "proyecto-x"]);
+    }
+
+    #[test]
+    fn inline_tags_skip_code_and_colors() {
+        let md = "uso #real aquí\n```css\n.a { color: #dc2626; } #id {}\n```\nel color `#fff` y color:#abc y #bad\n";
+        assert_eq!(extract_inline_tags(md), vec!["real".to_string()]);
     }
 
     #[test]
