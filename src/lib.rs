@@ -10,4 +10,5 @@ pub mod paths;
 pub mod recording;
 pub mod sounds;
 pub mod transcription;
+pub mod usage;
 pub mod vault;

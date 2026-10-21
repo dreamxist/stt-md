@@ -163,6 +163,18 @@ fn refresh_key_items(cfg: &Config, summarizer: &MenuItem, key: &MenuItem, remove
     remove.set_enabled(has_key);
 }
 
+fn refresh_spend_item(item: &MenuItem) {
+    let today = Local::now().date_naive();
+    let t = stt_md::usage::month_total(today);
+    let month = stt_md::usage::month_short_es(today);
+    item.set_text(format!(
+        "Gasto Gemini {month}: US${} · {} resumen{}",
+        format!("{:.2}", t.cost_usd).replace('.', ","),
+        t.calls,
+        if t.calls == 1 { "" } else { "es" }
+    ));
+}
+
 fn configure_gemini_key() {
     let Some(key) = api_key::ask_for_gemini_key() else {
         return;
@@ -243,6 +255,8 @@ fn run() -> anyhow::Result<()> {
     let stop_item = MenuItem::new("Detener", false, None);
     let separator = PredefinedMenuItem::separator();
     let summarizer_item = MenuItem::new("", false, None);
+    let spend_item = MenuItem::new("", false, None);
+    refresh_spend_item(&spend_item);
     let key_item = MenuItem::new("", true, None);
     let remove_key_item = MenuItem::new("Quitar API key de Gemini", false, None);
     let separator_2 = PredefinedMenuItem::separator();
@@ -254,6 +268,7 @@ fn run() -> anyhow::Result<()> {
         &stop_item,
         &separator,
         &summarizer_item,
+        &spend_item,
         &key_item,
         &remove_key_item,
         &separator_2,
@@ -287,6 +302,9 @@ fn run() -> anyhow::Result<()> {
     let mut last_tick = Instant::now() - Duration::from_secs(2);
     let mut silence_notified = false;
     let mut remote_missing_notified = false;
+    // `resummarize` and `--selftest` spend from other processes too, so the
+    // menu rereads the ledger now and then instead of only after a meeting.
+    let mut last_spend_refresh = Instant::now();
 
     event_loop.run(move |_event, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(250));
@@ -436,6 +454,11 @@ fn run() -> anyhow::Result<()> {
             }
         }
 
+        if last_spend_refresh.elapsed() >= Duration::from_secs(60) {
+            refresh_spend_item(&spend_item);
+            last_spend_refresh = Instant::now();
+        }
+
         while key_rx.try_recv().is_ok() {
             refresh_key_items(&cfg, &summarizer_item, &key_item, &remove_key_item);
         }
@@ -508,6 +531,7 @@ fn run() -> anyhow::Result<()> {
                 }
             }
             *state.lock() = AppState::Idle;
+            refresh_spend_item(&spend_item);
             start_item.set_enabled(true);
             stop_item.set_enabled(false);
             stop_item.set_text("Detener");
@@ -520,6 +544,7 @@ fn run() -> anyhow::Result<()> {
                 &stop_item,
                 &separator,
                 &summarizer_item,
+                &spend_item,
                 &key_item,
                 &remove_key_item,
                 &separator_2,
