@@ -68,7 +68,7 @@ impl WhisperEngine {
                     continue;
                 };
                 let text = strip_speaker_label(&text).to_string();
-                if is_known_hallucination(&text) {
+                if is_known_hallucination(&text) || is_foreign_script(&text, language) {
                     eprintln!("[stt-md] dropped hallucinated segment: {text}");
                     continue;
                 }
@@ -164,6 +164,21 @@ fn is_known_hallucination(text: &str) -> bool {
         .iter()
         .any(|&(o, c)| text.trim().starts_with(o) && text.trim().ends_with(c));
     bracketed || PHRASES.contains(&t.as_str())
+}
+
+/// Text in a script the meeting's language doesn't use. Over noise whisper
+/// drifts into other languages mid-segment ("…y Islands la рубemma del
+/// barco…", "*헤a*"), and no Spanish or English meeting has Cyrillic, Hangul,
+/// CJK or Arabic in it. Off when the language is "auto".
+fn is_foreign_script(text: &str, language: &str) -> bool {
+    if !matches!(language, "es" | "en" | "pt") {
+        return false;
+    }
+    text.chars().any(|c| {
+        matches!(c as u32,
+            0x0400..=0x04FF | 0x0600..=0x06FF | 0x1100..=0x11FF | 0x3040..=0x30FF
+            | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF)
+    })
 }
 
 /// How much of `phrase` is echoed at the start of `text`, in bytes.
@@ -432,6 +447,14 @@ mod tests {
     fn speech_windows_empty_for_silence() {
         assert!(speech_windows(&vec![0.0; 120 * SAMPLE_RATE]).is_empty());
         assert!(speech_windows(&[]).is_empty());
+    }
+
+    #[test]
+    fn foreign_script_only_trips_on_scripts_spanish_never_uses() {
+        assert!(is_foreign_script("y Islands la рубemma del barco", "es"));
+        assert!(is_foreign_script("*헤a*", "es"));
+        assert!(!is_foreign_script("Ñandú, pingüino, acción: ¿sí?", "es"));
+        assert!(!is_foreign_script("рубемма", "auto"));
     }
 
     #[test]
