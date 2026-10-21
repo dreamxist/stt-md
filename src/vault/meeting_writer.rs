@@ -76,6 +76,9 @@ pub fn write_meeting(
     }
     body.push_str("type: meeting\n");
     body.push_str("source: stt-md\n");
+    if let Some(model) = &summary.model {
+        body.push_str(&format!("summary_model: {model}\n"));
+    }
     body.push_str("---\n\n");
 
     body.push_str(&format!("# {}\n\n", summary.title));

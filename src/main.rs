@@ -1,4 +1,5 @@
 use stt_md::{
+    api_key,
     app_state, audio_utils, calendar_reminder, config, llm, meeting_detector, notifications, paths,
     recording, sounds, transcription, vault,
 };
@@ -115,6 +116,67 @@ fn main() {
     }
 }
 
+/// Two copies of the app (the installed one and the build in `dist/`) both
+/// show up in Spotlight under the same name, and opening both put two icons in
+/// the menubar that each recorded on their own. The first instance holds an
+/// exclusive lock on a file next to the config; a second one finds it taken
+/// and quits before drawing anything. The OS drops the lock if the app dies.
+fn claim_single_instance() -> anyhow::Result<Option<std::fs::File>> {
+    let path = Config::config_path().with_file_name("stt-md.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
+/// Summary models in the order they are tried. A saved Gemini key turns
+/// Gemini on even when the config doesn't name a model, so setting the key
+/// from the menu is all it takes.
+fn summarizer_chain(cfg: &Config) -> Vec<String> {
+    let cloud = cfg
+        .summary_model
+        .clone()
+        .or_else(|| api_key::gemini_key().map(|_| llm::gemini::DEFAULT_MODEL.to_string()));
+    cloud.into_iter().chain(std::iter::once(cfg.ollama_model.clone())).collect()
+}
+
+fn refresh_key_items(cfg: &Config, summarizer: &MenuItem, key: &MenuItem, remove: &MenuItem) {
+    let has_key = api_key::gemini_key().is_some();
+    let chain = summarizer_chain(cfg);
+    let uses_gemini = chain.first().is_some_and(|m| m.starts_with("gemini-"));
+    summarizer.set_text(match (uses_gemini, has_key) {
+        (true, true) => format!("Resumen: {} (respaldo local)", chain[0]),
+        (true, false) => format!("Resumen: local, falta la API key de {}", chain[0]),
+        (false, _) => format!("Resumen: local ({})", cfg.ollama_model),
+    });
+    key.set_text(if has_key {
+        "Cambiar API key de Gemini…"
+    } else {
+        "Configurar API key de Gemini…"
+    });
+    remove.set_enabled(has_key);
+}
+
+fn configure_gemini_key() {
+    let Some(key) = api_key::ask_for_gemini_key() else {
+        return;
+    };
+    let result = api_key::validate_gemini_key(&key).and_then(|()| api_key::save_gemini_key(&key));
+    match result {
+        Ok(()) => api_key::show_message(
+            "stt-md",
+            "Listo: la key funciona y quedó guardada en el Llavero. Las próximas reuniones se resumen con Gemini.",
+        ),
+        Err(e) => api_key::show_message("stt-md", &format!("No se guardó la key: {e:#}")),
+    }
+}
+
 fn show_fatal_alert(msg: &str) {
     let script = format!(
         "display alert \"stt-md no pudo iniciar\" message \"{}\" as critical",
@@ -165,6 +227,11 @@ fn run() -> anyhow::Result<()> {
         OutputMode::Simple => println!("[stt-md] mode: simple   → {}", cfg.output_dir.display()),
     }
     validate_startup(&cfg)?;
+    // Held for the life of the process: the event loop below never returns.
+    let Some(_instance_lock) = claim_single_instance()? else {
+        println!("[stt-md] already running, exiting");
+        return Ok(());
+    };
     let cfg = Arc::new(cfg);
 
     let mut event_loop = EventLoop::new();
@@ -175,14 +242,33 @@ fn run() -> anyhow::Result<()> {
     let start_item = MenuItem::new("Empezar reunión", true, None);
     let stop_item = MenuItem::new("Detener", false, None);
     let separator = PredefinedMenuItem::separator();
+    let summarizer_item = MenuItem::new("", false, None);
+    let key_item = MenuItem::new("", true, None);
+    let remove_key_item = MenuItem::new("Quitar API key de Gemini", false, None);
+    let separator_2 = PredefinedMenuItem::separator();
     let quit_item = MenuItem::new("Salir", true, None);
+    refresh_key_items(&cfg, &summarizer_item, &key_item, &remove_key_item);
 
-    let mut tray = Some(build_tray(&start_item, &stop_item, &separator, &quit_item)?);
+    let mut tray = Some(build_tray(&[
+        &start_item,
+        &stop_item,
+        &separator,
+        &summarizer_item,
+        &key_item,
+        &remove_key_item,
+        &separator_2,
+        &quit_item,
+    ])?);
 
     let menu_channel = MenuEvent::receiver();
     let start_id = start_item.id().clone();
     let stop_id = stop_item.id().clone();
+    let key_id = key_item.id().clone();
+    let remove_key_id = remove_key_item.id().clone();
     let quit_id = quit_item.id().clone();
+    // The key dialog blocks while open, so it runs off the main thread and
+    // reports back here; menu items can only be touched from the event loop.
+    let (key_tx, key_rx) = unbounded::<()>();
 
     let state = Arc::new(Mutex::new(AppState::Idle));
     let session: SessionSlot = Arc::new(Mutex::new(None));
@@ -332,7 +418,26 @@ fn run() -> anyhow::Result<()> {
                 }
             } else if event.id == stop_id {
                 stop_requested = true;
+            } else if event.id == key_id {
+                let tx = key_tx.clone();
+                thread::spawn(move || {
+                    configure_gemini_key();
+                    let _ = tx.send(());
+                });
+            } else if event.id == remove_key_id {
+                match api_key::delete_gemini_key() {
+                    Ok(()) => api_key::show_message(
+                        "stt-md",
+                        "Listo: la API key se borró del Llavero. Las reuniones se van a resumir con el modelo local.",
+                    ),
+                    Err(e) => api_key::show_message("stt-md", &format!("No se pudo borrar: {e:#}")),
+                }
+                refresh_key_items(&cfg, &summarizer_item, &key_item, &remove_key_item);
             }
+        }
+
+        while key_rx.try_recv().is_ok() {
+            refresh_key_items(&cfg, &summarizer_item, &key_item, &remove_key_item);
         }
 
         if stop_requested {
@@ -410,7 +515,16 @@ fn run() -> anyhow::Result<()> {
             // tray-icon 0.19 macOS has no working API to clear once a title
             // is set; only fully recreating the NSStatusItem works.
             tray.take();
-            match build_tray(&start_item, &stop_item, &separator, &quit_item) {
+            match build_tray(&[
+                &start_item,
+                &stop_item,
+                &separator,
+                &summarizer_item,
+                &key_item,
+                &remove_key_item,
+                &separator_2,
+                &quit_item,
+            ]) {
                 Ok(t) => {
                     let _ = t.set_tooltip(Some("stt-md".to_string()));
                     tray = Some(t);
@@ -422,14 +536,9 @@ fn run() -> anyhow::Result<()> {
     });
 }
 
-fn build_tray(
-    start: &MenuItem,
-    stop: &MenuItem,
-    sep: &PredefinedMenuItem,
-    quit: &MenuItem,
-) -> anyhow::Result<tray_icon::TrayIcon> {
+fn build_tray(items: &[&dyn tray_icon::menu::IsMenuItem]) -> anyhow::Result<tray_icon::TrayIcon> {
     let menu = Menu::new();
-    menu.append_items(&[start, stop, sep, quit])?;
+    menu.append_items(items)?;
     Ok(TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_icon(build_idle_icon())
@@ -531,7 +640,7 @@ fn process_recording(
                 at, run
             );
             format!(
-                "El audio del sistema se cortó en {:02}:{:02} y no volvió: desde ahí solo hay micrófono,                  la otra voz falta o aparece atribuida a «yo», y el resumen cubre nada más que la primera parte.",
+                "El audio del sistema se cortó en {:02}:{:02} y no volvió: desde ahí solo hay micrófono, la otra voz falta o aparece atribuida a «yo», y el resumen cubre nada más que la primera parte.",
                 (at as u64) / 60,
                 (at as u64) % 60
             )
@@ -601,17 +710,22 @@ fn process_obsidian_mode(
     let prompt = llm::prompts::build_summary_prompt(transcript_text, &vocab, &areas);
 
     println!(
-        "[stt-md] calling Ollama ({}) — this can take 20-60s…",
-        cfg.ollama_model
+        "[stt-md] summarizing with {} — this can take 20-60s…",
+        summarizer_chain(cfg).join(" → ")
     );
-    // The transcript must survive a bad summary. A 7B model returns broken
-    // JSON often enough that treating the summary as required loses meetings:
-    // one round trip is retried, and if that fails too the note is written
-    // with the transcript and says why it has no summary.
+    // The transcript must survive a bad summary: a cloud model can be out of
+    // reach and a 7B model returns broken JSON often enough. Each model in
+    // the chain gets its turn, and if all fail the note is written with the
+    // transcript and says why it has no summary.
     let mut summary =
-        llm::summarize_with_fallback(&prompt, &cfg.ollama_model, &cfg.ollama_url);
+        llm::summarize_with_fallback(
+            &prompt,
+            &summarizer_chain(cfg).iter().map(String::as_str).collect::<Vec<_>>(),
+            &cfg.ollama_url,
+        );
     summary.enforce_vocab(&vocab);
     summary.enforce_area(&areas);
+    summary.enforce_grounding(transcript_text);
 
     let meetings_dir_rel = vault::expand_pattern(&cfg.meetings_dir, &started_at_local);
     let daily_note_rel = vault::expand_pattern(&cfg.daily_note, &started_at_local);
@@ -670,6 +784,7 @@ fn process_simple_mode(
     let mut summary: llm::MeetingSummary = serde_json::from_str(&raw)
         .map_err(|e| anyhow::anyhow!("ollama returned invalid JSON: {e}\n--- raw ---\n{raw}"))?;
     summary.normalize_simple(4);
+    summary.enforce_grounding(transcript_text);
 
     let path = vault::simple_writer::write_simple(
         cfg.output_dir.as_path(),

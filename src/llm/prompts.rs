@@ -4,6 +4,7 @@ use crate::vault::scanner::VaultVocabulary;
 
 const MAX_FREE_TAGS: usize = 4;
 
+
 const MAX_TAGS_IN_PROMPT: usize = 150;
 const MAX_WIKILINKS_IN_PROMPT: usize = 100;
 
@@ -74,12 +75,11 @@ pub fn build_summary_prompt(transcript: &str, vocab: &VaultVocabulary, areas: &[
     let today = Local::now();
     let today_str = today.format("%Y-%m-%d (%A)").to_string();
 
-    let (areas_block, area_schema, area_rule, area_example) = if areas.is_empty() {
+    let (areas_block, area_schema, area_rule) = if areas.is_empty() {
         (
             String::new(),
             "null".to_string(),
             "8. \"area\": siempre null.".to_string(),
-            "null".to_string(),
         )
     } else {
         (
@@ -89,7 +89,6 @@ pub fn build_summary_prompt(transcript: &str, vocab: &VaultVocabulary, areas: &[
             ),
             "\"una de la lista de áreas o null\"".to_string(),
             "8. \"area\": elige EXACTAMENTE un valor de la lista de áreas (el más específico que aplique). Si ninguna calza claramente, usa null.".to_string(),
-            format!("\"{}\"", areas[0]),
         )
     };
 
@@ -109,7 +108,7 @@ REGLAS DURAS:
 2. Para "tags": SOLO valores de la lista de vocabulario. Si una palabra no aparece textualmente en el vocabulario, NO la pongas. Mejor lista vacía que tags inventados.
 3. Para "deadline": calcula fechas relativas usando hoy = {today_short}. "Jueves próximo" = primer jueves estrictamente después de hoy. Si no hay deadline explícito, usa null.
 4. "decisions" = acuerdos tomados sobre qué se va a hacer (sin quién). "action_items" = quién hace qué con deadline opcional. NO dupliques entre decisions y action_items.
-5. Nombres en kebab-case lowercase sin apellido: "Juan Pérez" → "juan", "María González" → "maria".
+5. Nombres en kebab-case lowercase, solo el nombre de pila, sin tildes ni apellido.
 6. NUNCA inventes personas. Si la transcripción NO menciona nombres propios explícitamente, devuelve people = []. Mejor lista vacía que nombres alucinados.
 7. Si la transcripción es solo un monólogo de prueba o saludo (sin reunión real), title puede ser "Nota rápida", summary breve, decisions/action_items/people vacíos.
 {area_rule}
@@ -117,8 +116,8 @@ REGLAS DURAS:
 
 SCHEMA EXACTO:
 {{
-  "title": "string corto sin fecha (ej: 'Acme standup')",
-  "summary_md": "markdown con 4-7 bullets sobre lo principal",
+  "title": "string corto sin fecha que nombre el tema concreto, nunca 'Reunión de trabajo'",
+  "summary_md": "markdown con 4-7 bullets; cada bullet dice QUÉ se dijo con lo concreto (empresas, montos, fechas, sistemas), nunca frases genéricas como 'se discutió sobre X'",
   "decisions": ["frases cortas, una por decisión"],
   "action_items": [
     {{ "who": "kebab-case o null", "task": "string", "deadline": "YYYY-MM-DD o null" }}
@@ -127,20 +126,6 @@ SCHEMA EXACTO:
   "tags": ["solo del vocabulario"],
   "project_wikilink": "[[nombre]] o null",
   "area": {area_schema}
-}}
-
-EJEMPLO de buena respuesta:
-{{
-  "title": "Sync proyecto-x sobre roadmap",
-  "summary_md": "- Avanzamos en la fase de discovery\n- Faltan validar requisitos con stakeholders",
-  "decisions": ["Se acordó priorizar el flow A sobre el B"],
-  "action_items": [
-    {{ "who": "ana", "task": "Documentar los requisitos funcionales", "deadline": "2026-04-30" }}
-  ],
-  "people": ["ana", "luis"],
-  "tags": ["proyecto-x", "roadmap"],
-  "project_wikilink": "[[proyecto-x]]",
-  "area": {area_example}
 }}
 
 TRANSCRIPCIÓN A RESUMIR:

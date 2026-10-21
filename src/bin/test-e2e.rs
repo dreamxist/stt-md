@@ -107,19 +107,13 @@ fn main() -> Result<()> {
         .collect();
 
     let prompt = llm::prompts::build_summary_prompt(&transcript_text, &vocab, &areas);
-    println!("[4/5] calling Ollama...");
+    println!("[4/5] summarizing with {}...", cfg.summary_models().join(" → "));
     let t0 = Instant::now();
-    let raw = llm::ollama::generate_json(
-        &prompt,
-        &cfg.ollama_model,
-        &cfg.ollama_url,
-    )?;
-    println!("[4/5] ollama returned in {}ms", t0.elapsed().as_millis());
-
-    let mut summary: llm::MeetingSummary = serde_json::from_str(&raw)
-        .map_err(|e| anyhow::anyhow!("invalid JSON: {e}\nraw:\n{raw}"))?;
+    let mut summary = llm::summarize_with_fallback(&prompt, &cfg.summary_models(), &cfg.ollama_url);
+    println!("[4/5] {:?} returned in {}ms", summary.model, t0.elapsed().as_millis());
     summary.enforce_vocab(&vocab);
     summary.enforce_area(&areas);
+    summary.enforce_grounding(&transcript_text);
     println!("[4/5] summary: {}", summary.title);
     println!("      tags: {:?}", summary.tags);
     println!("      project: {:?}", summary.project_wikilink);

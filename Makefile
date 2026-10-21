@@ -10,7 +10,7 @@ TARGET_DIR := target/release
 # SIGN_IDENTITY=... or fall back to ad-hoc ("-").
 SIGN_IDENTITY ?= $(shell security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/Apple Development/ {print $$2; exit}')
 
-.PHONY: dev build run clean check test $(TARGET_DIR)/$(BIN_NAME)
+.PHONY: dev build install run clean check test $(TARGET_DIR)/$(BIN_NAME)
 
 dev:
 	cargo run
@@ -37,6 +37,16 @@ $(APP_BUNDLE): $(TARGET_DIR)/$(BIN_NAME) Info.plist assets/AppIcon.icns
 # made `make build` skip recompilation after source changes (stale bundles).
 $(TARGET_DIR)/$(BIN_NAME):
 	cargo build --release
+
+# The bundle in dist/ is a build artifact, but Spotlight indexes it next to
+# the installed copy and both answer to "stt-md". Install moves it out of the
+# way so only /Applications/stt-md.app is left to launch.
+install: build
+	@pkill -x $(BIN_NAME) || true
+	@rm -rf /Applications/$(APP_NAME).app
+	@ditto $(APP_BUNDLE) /Applications/$(APP_NAME).app
+	@rm -rf $(APP_BUNDLE)
+	@echo "Installed /Applications/$(APP_NAME).app"
 
 run: build
 	open $(APP_BUNDLE)

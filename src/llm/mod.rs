@@ -1,3 +1,4 @@
+pub mod gemini;
 pub mod ollama;
 pub mod prompts;
 
@@ -34,32 +35,47 @@ pub struct MeetingSummary {
     /// the LLM from the closed list scanned from `areas_dir`. Obsidian mode only.
     #[serde(default)]
     pub area: Option<String>,
+    /// Which model wrote the summary; set by `summarize_with_fallback`.
+    #[serde(skip_deserializing)]
+    pub model: Option<String>,
 }
 
-/// Summarize, retry once, and fall back to a transcript-only note.
+/// Summarize with each model in turn, and fall back to a transcript-only note.
+///
+/// `models` goes from preferred to last resort: a cloud model first, the local
+/// one after it, so a meeting still gets a summary with no network or no
+/// quota left. The last model is retried once, as before.
 ///
 /// Never returns an error on purpose: losing a meeting because a local 7B model
 /// emitted broken JSON is a worse outcome than a note without a summary.
-pub fn summarize_with_fallback(prompt: &str, model: &str, url: &str) -> MeetingSummary {
-    match summarize_once(prompt, model, url) {
-        Ok(s) => s,
-        Err(first) => {
-            eprintln!("[stt-md] summary failed ({first:#}); retrying once");
+pub fn summarize_with_fallback(prompt: &str, models: &[&str], url: &str) -> MeetingSummary {
+    let mut last_error = String::from("no summary model configured");
+    for (i, model) in models.iter().enumerate() {
+        let attempts = if i + 1 == models.len() { 2 } else { 1 };
+        for _ in 0..attempts {
             match summarize_once(prompt, model, url) {
-                Ok(s) => s,
-                Err(second) => {
-                    eprintln!("[stt-md] summary failed again: {second:#}");
-                    MeetingSummary::unsummarized(&second.to_string())
+                Ok(mut s) => {
+                    s.model = Some((*model).to_string());
+                    return s;
+                }
+                Err(e) => {
+                    eprintln!("[stt-md] summary with {model} failed: {e:#}");
+                    last_error = e.to_string();
                 }
             }
         }
     }
+    MeetingSummary::unsummarized(&last_error)
 }
 
 fn summarize_once(prompt: &str, model: &str, url: &str) -> anyhow::Result<MeetingSummary> {
-    let raw = ollama::generate_json(prompt, model, url)?;
+    let raw = if model.starts_with("gemini-") {
+        gemini::generate_json(prompt, model)?
+    } else {
+        ollama::generate_json(prompt, model, url)?
+    };
     serde_json::from_str(&raw)
-        .map_err(|e| anyhow::anyhow!("ollama returned invalid JSON: {e}\n--- raw ---\n{raw}"))
+        .map_err(|e| anyhow::anyhow!("{model} returned invalid JSON: {e}\n--- raw ---\n{raw}"))
 }
 
 impl MeetingSummary {
@@ -83,6 +99,7 @@ impl MeetingSummary {
             tags: Vec::new(),
             project_wikilink: None,
             area: None,
+            model: None,
         }
     }
 
@@ -121,6 +138,31 @@ impl MeetingSummary {
         self.tags.truncate(max_tags);
         self.project_wikilink = None;
         self.area = None;
+    }
+
+    /// Drops people the transcript never names, and action items pinned on
+    /// them.
+    ///
+    /// A 7B model fills `people` from the prompt's own examples when the
+    /// meeting gives it nothing: a call where nobody said "Juan" came back with
+    /// `juan` in the people list and owning an action item. A name that isn't
+    /// in what was said can't be right, so it goes.
+    pub fn enforce_grounding(&mut self, transcript: &str) {
+        let said: HashSet<String> = transcript
+            .split(|c: char| !c.is_alphanumeric())
+            .map(normalize_person_name)
+            .filter(|w| !w.is_empty())
+            .collect();
+        // The transcript's own speaker labels are words in it too.
+        let named = |p: &str| {
+            !matches!(p, "yo" | "ellos") && p.split('-').all(|part| said.contains(part))
+        };
+        self.people.retain(|p| named(p));
+        for item in &mut self.action_items {
+            if item.who.as_deref().is_some_and(|w| !named(w)) {
+                item.who = None;
+            }
+        }
     }
 
     /// Keeps `area` only if it matches (case-insensitively) one of the vault's
@@ -274,6 +316,7 @@ mod tests {
             tags: vec![],
             project_wikilink: None,
             area: None,
+            model: None,
         }
     }
 
@@ -328,7 +371,7 @@ mod tests {
     #[test]
     fn a_dead_summarizer_still_yields_a_note() {
         // Port 1 refuses instantly: stands in for ollama down or babbling.
-        let s = summarize_with_fallback("cualquier cosa", "qwen2.5:7b", "http://127.0.0.1:1");
+        let s = summarize_with_fallback("cualquier cosa", &["qwen2.5:7b"], "http://127.0.0.1:1");
         assert_eq!(s.title, "Reunión sin resumen");
         assert!(s.summary_md.contains("transcripción"), "{}", s.summary_md);
         assert!(s.decisions.is_empty() && s.action_items.is_empty() && s.people.is_empty());
@@ -363,6 +406,21 @@ mod tests {
         assert_eq!(s.people, vec!["juan-perez"]);
         assert_eq!(s.action_items[0].who, Some("maria".into()));
         assert_eq!(s.action_items[0].deadline, None);
+    }
+
+    #[test]
+    fn enforce_grounding_drops_people_nobody_named() {
+        let mut s = summary();
+        s.people = vec!["juan".into(), "maria".into()];
+        s.action_items = vec![
+            ActionItem { who: Some("juan".into()), task: "a".into(), deadline: None },
+            ActionItem { who: Some("maria".into()), task: "b".into(), deadline: None },
+        ];
+        s.people.push("ellos".into());
+        s.enforce_grounding("[00:01] ellos: María, ¿me mandas la ficha?");
+        assert_eq!(s.people, vec!["maria".to_string()]);
+        assert_eq!(s.action_items[0].who, None);
+        assert_eq!(s.action_items[1].who.as_deref(), Some("maria"));
     }
 
     #[test]

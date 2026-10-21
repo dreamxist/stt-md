@@ -53,6 +53,12 @@ pub struct Config {
     #[serde(default)]
     pub daily_template: Option<String>,
 
+    /// Preferred summarizer, tried before `ollama_model`, e.g.
+    /// "gemini-3.8-flash". Its API key is read from `GEMINI_API_KEY` or the
+    /// login Keychain, never from this file. `None` summarizes locally only.
+    #[serde(default)]
+    pub summary_model: Option<String>,
+
     pub ollama_model: String,
     pub ollama_url: String,
     pub whisper_language: String,
@@ -115,6 +121,7 @@ impl Default for Config {
             daily_note: default_daily_note(),
             areas_dir: None,
             daily_template: None,
+            summary_model: None,
             ollama_model: "qwen2.5:7b".to_string(),
             ollama_url: "http://localhost:11434".to_string(),
             whisper_language: "es".to_string(),
@@ -127,6 +134,15 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Models to try for the summary, preferred first.
+    pub fn summary_models(&self) -> Vec<&str> {
+        self.summary_model
+            .as_deref()
+            .into_iter()
+            .chain(std::iter::once(self.ollama_model.as_str()))
+            .collect()
+    }
+
     pub fn config_path() -> PathBuf {
         paths::app_support_dir().join("config.toml")
     }
@@ -163,6 +179,14 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_models_put_the_cloud_model_before_the_local_one() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.summary_models(), vec!["qwen2.5:7b"]);
+        cfg.summary_model = Some("gemini-3.8-flash".into());
+        assert_eq!(cfg.summary_models(), vec!["gemini-3.8-flash", "qwen2.5:7b"]);
+    }
 
     #[test]
     fn simple_mode_config_parses_without_vault_root() {
