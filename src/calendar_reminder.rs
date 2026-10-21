@@ -7,12 +7,10 @@
 //! si se niega, el hilo queda inactivo en silencio.
 
 use std::collections::HashSet;
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use block2::RcBlock;
-use objc2::rc::autoreleasepool;
+use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::Bool;
 use objc2_event_kit::{EKAuthorizationStatus, EKEntityType, EKEvent, EKEventStore};
 use objc2_foundation::{NSDate, NSError};
@@ -37,26 +35,38 @@ const VIDEO_LINK_HINTS: &[&str] = &[
     "around.co",
 ];
 
-pub fn spawn(state: Arc<Mutex<AppState>>) {
-    let _ = thread::Builder::new()
-        .name("calendar-reminder".into())
-        .spawn(move || run_loop(state));
+pub struct CalendarReminder {
+    store: Retained<EKEventStore>,
+    handled: HashSet<String>,
+    next_check: Instant,
 }
 
-fn run_loop(state: Arc<Mutex<AppState>>) {
-    let store = unsafe { EKEventStore::new() };
-    request_access_if_needed(&store);
-
-    // Eventos ya resueltos (avisados, o que se estaban grabando). Clave con
-    // la hora de inicio: una serie recurrente comparte identifier.
-    let mut handled: HashSet<String> = HashSet::new();
-
-    loop {
-        let status = unsafe { EKEventStore::authorizationStatusForEntityType(EKEntityType::Event) };
-        if status == EKAuthorizationStatus::FullAccess {
-            autoreleasepool(|_| check_events(&store, &state, &mut handled));
+impl CalendarReminder {
+    /// SOLO en el hilo principal: EventKit + TCC interactúan con AppKit, y
+    /// usarlo desde un hilo secundario rompía el menú del tray en macOS 26
+    /// (el ícono se veía pero el click no desplegaba nada).
+    pub fn new() -> Self {
+        let store = unsafe { EKEventStore::new() };
+        request_access_if_needed(&store);
+        Self {
+            store,
+            handled: HashSet::new(),
+            next_check: Instant::now(),
         }
-        thread::sleep(POLL_INTERVAL);
+    }
+
+    /// Called from the main event-loop tick; polls EventKit at most once per
+    /// POLL_INTERVAL.
+    pub fn poll(&mut self, state: &Mutex<AppState>) {
+        if Instant::now() < self.next_check {
+            return;
+        }
+        self.next_check = Instant::now() + POLL_INTERVAL;
+        let status =
+            unsafe { EKEventStore::authorizationStatusForEntityType(EKEntityType::Event) };
+        if status == EKAuthorizationStatus::FullAccess {
+            autoreleasepool(|_| check_events(&self.store, state, &mut self.handled));
+        }
     }
 }
 

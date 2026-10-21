@@ -273,12 +273,19 @@ fn run() -> anyhow::Result<()> {
     let state = Arc::new(Mutex::new(AppState::Idle));
     let session: SessionSlot = Arc::new(Mutex::new(None));
 
+    let mut calendar: Option<calendar_reminder::CalendarReminder> = None;
     if cfg.meeting_reminder {
         meeting_detector::spawn(state.clone(), cfg.meeting_reminder_apps.clone());
-        calendar_reminder::spawn(state.clone());
+        // El recordatorio de calendario corre en el hilo principal: EventKit
+        // desde un hilo secundario rompía el menú del tray en macOS 26.
+        calendar = Some(calendar_reminder::CalendarReminder::new());
     }
 
     let (proc_tx, proc_rx): (Sender<ProcessingMsg>, Receiver<ProcessingMsg>) = unbounded();
+
+    // Notify-rust desde un hilo worker rompe el menú del tray en macOS 26;
+    // las notificaciones se encolan y el loop principal las drena.
+    let notify_rx = notifications::main_thread_receiver();
 
     // Refresh title + tooltip + stop-item label every ~1s during
     // recording/processing. tray-icon 0.19 on macOS can't reliably clear a
@@ -290,6 +297,11 @@ fn run() -> anyhow::Result<()> {
 
     event_loop.run(move |_event, _, control_flow| {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(250));
+
+        if let Some(cal) = calendar.as_mut() {
+            cal.poll(&state);
+        }
+        notifications::drain(&notify_rx);
 
         let st = *state.lock();
         match st {
