@@ -47,8 +47,13 @@ pub fn load_wav_mono_f32(path: &Path) -> Result<(Vec<f32>, u32)> {
 /// run rather than the tail because a tap that gets revived mid-meeting leaves
 /// its gap in the middle, and because a stray sound at the end is enough to
 /// hide a dropout that lasted twenty minutes.
+///
+/// A short flatline at the very end is the call hanging up before the
+/// recording was stopped, not a dead tap: it is ignored, otherwise the note
+/// warns that the summary is partial when nothing was lost.
 pub fn dead_air(samples: &[f32], sample_rate: u32) -> Option<(f32, f32)> {
     let min_run = sample_rate as usize * 60;
+    let min_trailing_run = sample_rate as usize * 180;
     let (mut best_start, mut best_len) = (0usize, 0usize);
     let mut run_start = 0usize;
     for (i, s) in samples.iter().enumerate() {
@@ -60,8 +65,9 @@ pub fn dead_air(samples: &[f32], sample_rate: u32) -> Option<(f32, f32)> {
             run_start = i + 1;
         }
     }
-    if samples.len() - run_start > best_len {
-        best_len = samples.len() - run_start;
+    let trailing = samples.len() - run_start;
+    if trailing >= min_trailing_run && trailing > best_len {
+        best_len = trailing;
         best_start = run_start;
     }
     let rate = sample_rate as f32;
@@ -118,6 +124,21 @@ mod tests {
         assert_eq!(dead_air(&samples, 16_000), None);
     }
 
+
+    #[test]
+    fn dead_air_ignores_a_call_that_hung_up_before_stop() {
+        let mut samples = tone(60 * 28, 16_000);
+        samples.extend(std::iter::repeat_n(0.0, 16_000 * 104));
+        assert_eq!(dead_air(&samples, 16_000), None);
+    }
+
+    #[test]
+    fn dead_air_still_flags_a_tap_that_died_and_never_came_back() {
+        let mut samples = tone(60 * 10, 16_000);
+        samples.extend(std::iter::repeat_n(0.0, 16_000 * 60 * 15));
+        let (at, _) = dead_air(&samples, 16_000).expect("15 dead minutes at the end");
+        assert!((at - 600.0).abs() < 1.0);
+    }
 
     #[test]
     fn resample_identity_at_16k() {
