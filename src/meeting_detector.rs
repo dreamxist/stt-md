@@ -46,6 +46,17 @@ const POLL_INTERVAL: Duration = Duration::from_secs(4);
 const RELEASE_DEBOUNCE: Duration = Duration::from_secs(30);
 /// Resguardo extra entre avisos de sesiones distintas.
 const NOTIFY_COOLDOWN: Duration = Duration::from_secs(60);
+/// Una llamada toma el mic *y* reproduce audio; un audio de WhatsApp solo
+/// graba. Con ambas cosas a la vez durante este rato, es una llamada.
+const CALL_CONFIRM: Duration = Duration::from_secs(8);
+/// Sin reproducción no se sabe qué es, así que se espera: los audios de
+/// WhatsApp dispararon «¿Reunión en curso?» cinco veces seguidas en un día, y
+/// casi ninguno dura tanto. Una llamada real que no se detecte por la otra vía
+/// (sala de espera, todos en silencio) avisa igual, solo que más tarde.
+const MIC_ONLY_HOLD: Duration = Duration::from_secs(45);
+/// «¿Terminó la reunión?» solo si la app tuvo el mic al menos este rato: lo que
+/// suelta el mic a los segundos de empezar a grabar no era la reunión.
+const MIN_CALL_FOR_END_HINT: Duration = Duration::from_secs(3 * 60);
 
 /// Lanza el hilo detector. `custom_apps` (config `meeting_reminder_apps`)
 /// reemplaza la lista por defecto; son prefijos de bundle ID.
@@ -55,16 +66,23 @@ pub fn spawn(state: Arc<Mutex<AppState>>, custom_apps: Option<Vec<String>>) {
         .spawn(move || run_loop(state, custom_apps));
 }
 
+/// Si ya toca avisar: la app lleva `held` con el mic y `playing_for`
+/// reproduciendo además (o `None` si no reproduce).
+fn should_remind(held: Duration, playing_for: Option<Duration>) -> bool {
+    playing_for.is_some_and(|p| p >= CALL_CONFIRM) || held >= MIC_ONLY_HOLD
+}
+
 fn run_loop(state: Arc<Mutex<AppState>>, custom_apps: Option<Vec<String>>) {
     let custom: Option<Vec<String>> =
         custom_apps.map(|v| v.into_iter().map(|s| s.to_ascii_lowercase()).collect());
 
     // Una "sesión" es un tramo continuo (con debounce) en que alguna app de
     // la lista mantiene el mic. Se avisa a lo más una vez por sesión, y no
-    // necesariamente en el primer poll: si la reunión parte durante
-    // Processing (post-proceso de la reunión anterior) o dentro del cooldown,
-    // el aviso queda pendiente y sale apenas se pueda, en vez de perderse.
-    let mut in_session = false;
+    // necesariamente en el primer poll: hay que esperar a saber si es una
+    // llamada, y si cae dentro del cooldown el aviso queda pendiente y sale
+    // apenas se pueda, en vez de perderse.
+    let mut session_started: Option<Instant> = None;
+    let mut playing_since: Option<Instant> = None;
     let mut handled = false;
     let mut last_seen: Option<Instant> = None;
     let mut last_notified: Option<Instant> = None;
@@ -73,11 +91,15 @@ fn run_loop(state: Arc<Mutex<AppState>>, custom_apps: Option<Vec<String>>) {
         thread::sleep(POLL_INTERVAL);
 
         let Some(app) = detect_meeting_app(custom.as_deref()) else {
-            if in_session && last_seen.is_none_or(|t| t.elapsed() >= RELEASE_DEBOUNCE) {
-                in_session = false;
+            if let Some(started) = session_started
+                && last_seen.is_none_or(|t| t.elapsed() >= RELEASE_DEBOUNCE)
+            {
+                session_started = None;
+                playing_since = None;
                 // La app de reuniones soltó el mic pero seguimos grabando:
                 // lo típico es haber cortado la call y olvidar Detener.
-                if state.lock().is_recording() {
+                let held = last_seen.map_or(Duration::ZERO, |seen| seen.duration_since(started));
+                if state.lock().is_recording() && held >= MIN_CALL_FOR_END_HINT {
                     println!("[stt-md] meeting app released the mic while recording");
                     notifications::meeting_ended_still_recording();
                 }
@@ -85,11 +107,17 @@ fn run_loop(state: Arc<Mutex<AppState>>, custom_apps: Option<Vec<String>>) {
             continue;
         };
 
-        last_seen = Some(Instant::now());
-        if !in_session {
-            in_session = true;
+        let now = Instant::now();
+        last_seen = Some(now);
+        let started = *session_started.get_or_insert_with(|| {
             handled = false;
-        }
+            now
+        });
+        playing_since = if app.also_playing {
+            playing_since.or(Some(now))
+        } else {
+            None
+        };
         if handled {
             continue;
         }
@@ -97,39 +125,65 @@ fn run_loop(state: Arc<Mutex<AppState>>, custom_apps: Option<Vec<String>>) {
             // Ya están grabando esta reunión: no molestar, tampoco después
             // (p. ej. si detienen la grabación antes de que termine la call).
             AppState::Recording { .. } => handled = true,
-            // Esperar a Idle: reunión nueva durante el post-proceso.
-            AppState::Processing => {}
             AppState::Idle => {
-                if last_notified.is_none_or(|t| t.elapsed() >= NOTIFY_COOLDOWN) {
-                    println!("[stt-md] meeting detected: {app} is capturing the mic");
-                    notifications::meeting_detected(&app);
+                let playing_for = playing_since.map(|t| now.duration_since(t));
+                if should_remind(now.duration_since(started), playing_for)
+                    && last_notified.is_none_or(|t| t.elapsed() >= NOTIFY_COOLDOWN)
+                {
+                    println!("[stt-md] meeting detected: {} is capturing the mic", app.name);
+                    notifications::meeting_detected(&app.name);
                     handled = true;
-                    last_notified = Some(Instant::now());
+                    last_notified = Some(now);
                 }
             }
         }
     }
 }
 
-/// Nombre de la primera app de reuniones que está capturando el micrófono
-/// ahora mismo, o `None`. El propio proceso se excluye (graba con cpal).
-fn detect_meeting_app(custom: Option<&[String]>) -> Option<String> {
+/// Una app de reuniones con el micrófono tomado.
+#[derive(Debug, PartialEq)]
+struct Detected {
+    name: String,
+    /// Algún proceso de la misma app está reproduciendo audio: es una llamada
+    /// y no solo una grabación.
+    also_playing: bool,
+}
+
+/// La primera app de reuniones que está capturando el micrófono ahora mismo,
+/// o `None`. El propio proceso se excluye (graba con cpal).
+fn detect_meeting_app(custom: Option<&[String]>) -> Option<Detected> {
     let own_pid = std::process::id() as i32;
-    for obj in coreaudio::process_objects() {
-        if !coreaudio::is_running_input(obj) {
-            continue;
-        }
-        if coreaudio::pid(obj) == Some(own_pid) {
-            continue;
-        }
-        let Some(bundle) = coreaudio::bundle_id(obj) else {
-            continue;
-        };
-        if let Some(name) = meeting_app_name(&bundle, custom) {
-            return Some(name);
-        }
-    }
-    None
+    let processes: Vec<AudioProcess> = coreaudio::process_objects()
+        .into_iter()
+        .filter(|&obj| coreaudio::pid(obj) != Some(own_pid))
+        .filter_map(|obj| {
+            let (input, output) = (coreaudio::is_running_input(obj), coreaudio::is_running_output(obj));
+            if !input && !output {
+                return None;
+            }
+            Some(AudioProcess { bundle: coreaudio::bundle_id(obj)?.to_ascii_lowercase(), input, output })
+        })
+        .collect();
+    pick_meeting_app(&processes, custom)
+}
+
+/// Un proceso que el HAL ve usando audio.
+struct AudioProcess {
+    bundle: String,
+    input: bool,
+    output: bool,
+}
+
+fn pick_meeting_app(processes: &[AudioProcess], custom: Option<&[String]>) -> Option<Detected> {
+    processes.iter().filter(|p| p.input).find_map(|p| {
+        let (prefix, name) = meeting_app(&p.bundle, custom)?;
+        // El que captura y el que reproduce pueden ser helpers distintos de
+        // la misma app, por eso se compara por prefijo y no por proceso.
+        let also_playing = processes
+            .iter()
+            .any(|q| q.output && q.bundle.starts_with(&prefix));
+        Some(Detected { name, also_playing })
+    })
 }
 
 /// Whether some other process is feeding the output right now.
@@ -147,16 +201,25 @@ pub fn output_is_playing() -> bool {
     })
 }
 
-/// Nombre a mostrar si `bundle` es una app de reuniones de la lista, o `None`.
-fn meeting_app_name(bundle: &str, custom: Option<&[String]>) -> Option<String> {
+/// (prefijo que calzó, nombre a mostrar) si `bundle` es una app de reuniones
+/// de la lista, o `None`.
+fn meeting_app(bundle: &str, custom: Option<&[String]>) -> Option<(String, String)> {
     let bundle = bundle.to_ascii_lowercase();
     match custom {
-        Some(list) => list.iter().find(|p| bundle.starts_with(p.as_str())).cloned(),
+        Some(list) => list
+            .iter()
+            .find(|p| bundle.starts_with(p.as_str()))
+            .map(|p| (p.clone(), p.clone())),
         None => DEFAULT_MEETING_APPS
             .iter()
             .find(|(p, _)| bundle.starts_with(p))
-            .map(|(_, name)| (*name).to_string()),
+            .map(|(p, name)| ((*p).to_string(), (*name).to_string())),
     }
+}
+
+#[cfg(test)]
+fn meeting_app_name(bundle: &str, custom: Option<&[String]>) -> Option<String> {
+    meeting_app(bundle, custom).map(|(_, name)| name)
 }
 
 /// FFI mínima a CoreAudio para los process objects (AudioHardware.h, macOS 14+).
@@ -336,6 +399,52 @@ mod tests {
         }
         let detected = detect_meeting_app(None);
         println!("meeting app detected: {detected:?}");
+    }
+
+    fn process(bundle: &str, input: bool, output: bool) -> AudioProcess {
+        AudioProcess { bundle: bundle.to_string(), input, output }
+    }
+
+    /// Los audios de WhatsApp toman el mic sin reproducir nada; una llamada
+    /// hace las dos cosas, aunque sea desde helpers distintos.
+    #[test]
+    fn a_call_is_told_apart_from_a_voice_note_by_playback() {
+        let voice_note = [process("net.whatsapp.whatsapp", true, false)];
+        assert_eq!(
+            pick_meeting_app(&voice_note, None),
+            Some(Detected { name: "WhatsApp".into(), also_playing: false })
+        );
+
+        let meet = [
+            process("com.apple.music", false, true),
+            process("com.google.chrome.helper", true, false),
+            process("com.google.chrome.helper.renderer", false, true),
+        ];
+        assert_eq!(
+            pick_meeting_app(&meet, None),
+            Some(Detected { name: "Chrome".into(), also_playing: true })
+        );
+
+        // Otra app sonando no convierte un audio en llamada.
+        let note_with_music = [
+            process("com.apple.music", false, true),
+            process("net.whatsapp.whatsapp", true, false),
+        ];
+        assert!(!pick_meeting_app(&note_with_music, None).unwrap().also_playing);
+
+        // Una app de la lista que solo reproduce no es una reunión.
+        assert_eq!(pick_meeting_app(&[process("us.zoom.xos", false, true)], None), None);
+    }
+
+    #[test]
+    fn reminder_waits_to_know_it_is_a_call() {
+        let secs = Duration::from_secs;
+        // Llamada confirmada: mic + reproducción sostenidos.
+        assert!(!should_remind(secs(4), Some(secs(4))));
+        assert!(should_remind(secs(8), Some(secs(8))));
+        // Solo mic: un audio de 20 s no avisa; algo largo sí.
+        assert!(!should_remind(secs(20), None));
+        assert!(should_remind(secs(45), None));
     }
 
     #[test]

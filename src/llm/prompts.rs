@@ -52,7 +52,26 @@ fn fit_transcript(transcript: &str) -> String {
     )
 }
 
-pub fn build_summary_prompt(transcript: &str, vocab: &VaultVocabulary, areas: &[String]) -> String {
+/// The calendar event that was on when the recording started, as a hint.
+///
+/// A title like "CRM Taram" tells the model what the call was and how the
+/// project is spelled, which the audio alone often doesn't. It is only a hint:
+/// people record ad hoc calls over a scheduled slot they skipped.
+fn calendar_block(calendar_title: Option<&str>) -> String {
+    match calendar_title.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(title) => format!(
+            "\nEVENTO DEL CALENDARIO A ESTA HORA: «{title}»\n(Pista para el título y para escribir bien los nombres propios. Si la transcripción trata de otra cosa, ignóralo. No agregues personas ni hechos a partir de esta línea.)\n"
+        ),
+        None => String::new(),
+    }
+}
+
+pub fn build_summary_prompt(
+    transcript: &str,
+    vocab: &VaultVocabulary,
+    areas: &[String],
+    calendar_title: Option<&str>,
+) -> String {
     let mut all_tags: Vec<String> = vocab.all_tags();
     all_tags.sort();
     all_tags.dedup();
@@ -101,7 +120,7 @@ VOCABULARIO DE TAGS PERMITIDOS (lista cerrada — NO existe ningún tag fuera de
 
 WIKILINKS POSIBLES (nombres de archivos del vault — proyectos, personas, conceptos):
 {wikilinks_str}
-{areas_block}
+{areas_block}{calendar_block}
 
 REGLAS DURAS:
 1. Responde EXCLUSIVAMENTE con JSON válido. Sin explicaciones, sin markdown fences.
@@ -136,13 +155,14 @@ JSON:"#,
         today_short = today.format("%Y-%m-%d"),
         tags_str = tags_str,
         wikilinks_str = wikilinks_str,
+        calendar_block = calendar_block(calendar_title),
         transcript = fit_transcript(transcript),
     )
 }
 
 /// Prompt for `output_mode = "simple"` — no vault, no closed vocabulary.
 /// LLM picks up to MAX_FREE_TAGS tags freely (lowercase kebab-case).
-pub fn build_simple_summary_prompt(transcript: &str) -> String {
+pub fn build_simple_summary_prompt(transcript: &str, calendar_title: Option<&str>) -> String {
     let today = Local::now();
     let today_str = today.format("%Y-%m-%d (%A)").to_string();
     let today_short = today.format("%Y-%m-%d").to_string();
@@ -150,7 +170,7 @@ pub fn build_simple_summary_prompt(transcript: &str) -> String {
     format!(
         r#"Eres un asistente que resume reuniones en español chileno neutro.
 Hoy es {today_str}.
-
+{calendar_block}
 REGLAS DURAS:
 1. Responde EXCLUSIVAMENTE con JSON válido. Sin explicaciones, sin markdown fences.
 2. "deadline": fechas relativas usando hoy = {today_short}. "Jueves próximo" = primer jueves estrictamente después de hoy. Si no hay deadline explícito, usa null. Solo formato YYYY-MM-DD.
@@ -182,6 +202,7 @@ JSON:"#,
         today_str = today_str,
         today_short = today_short,
         max_tags = MAX_FREE_TAGS,
+        calendar_block = calendar_block(calendar_title),
         transcript = fit_transcript(transcript),
     )
 }
@@ -217,9 +238,23 @@ mod tests {
 
     #[test]
     fn rules_survive_for_a_transcript_that_used_to_blow_the_context() {
-        let prompt = build_summary_prompt(&transcript_of(4_000), &VaultVocabulary::default(), &[]);
+        let prompt =
+            build_summary_prompt(&transcript_of(4_000), &VaultVocabulary::default(), &[], None);
         assert!(prompt.starts_with("Eres un asistente"));
         assert!(prompt.contains("REGLAS DURAS"));
         assert!(prompt.contains("SCHEMA EXACTO"));
+    }
+
+    #[test]
+    fn the_calendar_title_reaches_both_prompts_only_when_there_is_one() {
+        let vocab = VaultVocabulary::default();
+        let with = build_summary_prompt("[00:00] hola\n", &vocab, &[], Some("CRM Acme"));
+        assert!(with.contains("EVENTO DEL CALENDARIO A ESTA HORA: «CRM Acme»"));
+        assert!(build_simple_summary_prompt("[00:00] hola\n", Some("CRM Acme")).contains("«CRM Acme»"));
+
+        for none in [None, Some("   ")] {
+            assert!(!build_summary_prompt("[00:00] hola\n", &vocab, &[], none).contains("EVENTO DEL"));
+            assert!(!build_simple_summary_prompt("[00:00] hola\n", none).contains("EVENTO DEL"));
+        }
     }
 }

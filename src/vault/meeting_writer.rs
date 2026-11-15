@@ -14,13 +14,16 @@ pub struct WrittenMeeting {
     pub stem: String,
 }
 
-/// Where a meeting's tracks live and whether one of them let us down.
-pub struct AudioContext<'a> {
+/// What a note records besides the summary: where its tracks live, whether
+/// one of them let us down, and the calendar event it belongs to.
+pub struct NoteContext<'a> {
     pub mic_path: &'a Path,
     pub sys_path: Option<&'a Path>,
     /// Set when a track dropped out, so the note can say so before anyone
     /// reads a summary drawn from half the audio.
     pub warning: Option<&'a str>,
+    /// Title of the calendar event that was on when the recording started.
+    pub event: Option<&'a str>,
 }
 
 pub fn write_meeting(
@@ -30,13 +33,14 @@ pub fn write_meeting(
     summary: &MeetingSummary,
     segments: &[TranscriptSegment],
     duration_min: i64,
-    audio: &AudioContext<'_>,
+    context: &NoteContext<'_>,
 ) -> Result<WrittenMeeting> {
-    let AudioContext {
+    let NoteContext {
         mic_path: audio_path,
         sys_path: audio_sys_path,
         warning: audio_warning,
-    } = *audio;
+        event,
+    } = *context;
     let slug = slugify(&summary.title);
     let meetings_dir = vault_root.join(meetings_dir_rel);
     fs::create_dir_all(&meetings_dir)?;
@@ -64,6 +68,9 @@ pub fn write_meeting(
     }
     if let Some(area) = &summary.area {
         body.push_str(&format!("area: {}\n", yaml_quote(area)));
+    }
+    if let Some(event) = event {
+        body.push_str(&format!("event: {}\n", yaml_quote(event)));
     }
     if !audio_filename.is_empty() {
         body.push_str(&format!("audio: {audio_filename}\n"));

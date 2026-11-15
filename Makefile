@@ -40,13 +40,17 @@ $(TARGET_DIR)/$(BIN_NAME):
 
 # The bundle in dist/ is a build artifact, but Spotlight indexes it next to
 # the installed copy and both answer to "stt-md". Install moves it out of the
-# way so only /Applications/stt-md.app is left to launch.
+# way so only /Applications/stt-md.app is left to launch. The running app is
+# asked to quit first (pkill is for versions that predate `quit`), so a
+# recording or a note in progress survives the swap: it stays in the queue
+# and the relaunched app picks it up.
 install: build
-	@pkill -x $(BIN_NAME) || true
+	@/Applications/$(APP_NAME).app/Contents/MacOS/$(BIN_NAME) quit >/dev/null 2>&1; sleep 1; pkill -x $(BIN_NAME) || true
 	@rm -rf /Applications/$(APP_NAME).app
 	@ditto $(APP_BUNDLE) /Applications/$(APP_NAME).app
 	@rm -rf $(APP_BUNDLE)
-	@echo "Installed /Applications/$(APP_NAME).app"
+	@open /Applications/$(APP_NAME).app
+	@echo "Installed and relaunched /Applications/$(APP_NAME).app"
 
 run: build
 	open $(APP_BUNDLE)

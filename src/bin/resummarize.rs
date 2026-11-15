@@ -13,10 +13,11 @@ fn main() -> Result<()> {
         std::process::exit(1);
     };
     let cfg = Config::load_or_init()?;
-    let models: Vec<&str> = match args.get(3) {
-        Some(m) => vec![m.as_str()],
+    let models: Vec<String> = match args.get(3) {
+        Some(m) => vec![m.clone()],
         None => cfg.summary_models(),
     };
+    let models: Vec<&str> = models.iter().map(String::as_str).collect();
     let vault_root = PathBuf::from(vault_root);
 
     let content = std::fs::read_to_string(note).with_context(|| format!("reading {note}"))?;
@@ -32,7 +33,7 @@ fn main() -> Result<()> {
         .as_deref()
         .map(|d| vault::scanner::scan_areas(&vault_root, d))
         .unwrap_or_default();
-    let prompt = llm::prompts::build_summary_prompt(&transcript, &vocab, &areas);
+    let prompt = llm::prompts::build_summary_prompt(&transcript, &vocab, &areas, None);
     let mut summary = llm::summarize_with_fallback(&prompt, &models, &cfg.ollama_url);
     summary.enforce_vocab(&vocab);
     summary.enforce_area(&areas);

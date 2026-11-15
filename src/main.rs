@@ -1,64 +1,111 @@
 use stt_md::{
-    api_key,
-    app_state, audio_utils, calendar_reminder, config, llm, meeting_detector, notifications, paths,
-    recording, sounds, transcription, vault,
+    activity::KeepAwake, api_key, app_state, calendar_reminder, config, control, history, jobs, logging,
+    meeting_detector, notifications, paths, pipeline, recording, sounds, usage,
 };
 
-use std::path::PathBuf;
+mod app {
+    pub mod icon;
+    pub mod menu;
+}
+
+use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Local};
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use parking_lot::Mutex;
-use tao::event_loop::{ControlFlow, EventLoop};
+use global_hotkey::hotkey::HotKey;
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+use parking_lot::{Mutex, RwLock};
+use tao::event::Event;
+use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIconBuilder};
+use tray_icon::menu::{MenuEvent, MenuId};
+use tray_icon::TrayIcon;
 
+use app::menu::{pretty_hotkey, Action, AppMenu, RECENT_NOTES};
 use app_state::AppState;
 use config::{Config, OutputMode};
-use recording::{RecordingOutput, RecordingSession};
-use transcription::whisper::WhisperEngine;
+use jobs::{Job, JobEvent, JobStatus, SharedConfig};
+use pipeline::{RecordingInput, Stage};
+use recording::RecordingSession;
 
-enum ProcessingMsg {
-    Done(PathBuf),
-    Failed(String),
-}
+/// Hard cap on a single recording; beyond this the Stop was forgotten.
+const MAX_RECORDING_HOURS: i64 = 4;
+/// Quiet time after which a still-running recording is probably a forgotten
+/// Stop (meeting over, laptop left open).
+const SILENCE_REMINDER: Duration = Duration::from_secs(5 * 60);
+/// How often the menubar title, tooltip and status line are redrawn.
+const REDRAW: Duration = Duration::from_millis(900);
+/// How long the event loop sleeps when nothing wakes it. Clicks, the shortcut,
+/// control commands and job progress all wake it themselves, so the timer is
+/// only there for the clock in the menubar and the periodic checks.
+const TICK_BUSY: Duration = Duration::from_millis(500);
+const TICK_IDLE: Duration = Duration::from_secs(2);
+const CONFIG_CHECK: Duration = Duration::from_secs(2);
+const SPEND_REFRESH: Duration = Duration::from_secs(60);
 
-type SessionSlot = Arc<Mutex<Option<(RecordingSession, DateTime<Local>)>>>;
+const USAGE: &str = "\
+stt-md                 abre la app en la menubar
+stt-md toggle          empieza o detiene la grabación en la app abierta
+stt-md start | stop    lo mismo, sin alternar
+stt-md status          estado de la app abierta, en JSON
+stt-md quit            cierra la app abierta; lo que esté grabando queda en cola
+stt-md --selftest [s]  graba s segundos (20) y procesa, sin menubar";
 
-/// Send stdout and stderr to a file when there is no terminal to read them.
-///
-/// Launched from Finder the app has nowhere to print, so every diagnostic it
-/// already writes is discarded — which is how a failed meeting left no trace at
-/// all: the note was never written, the failure notification was swallowed by
-/// macOS because the rebuilt bundle had no permission for it, and the error
-/// itself went to a closed pipe.
-fn redirect_output_to_log() {
-    use std::os::fd::AsRawFd;
-
-    if unsafe { libc::isatty(libc::STDERR_FILENO) } == 1 {
-        return;
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("--selftest") => {
+            let seconds = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(20);
+            match selftest(seconds) {
+                Ok(()) => println!("[selftest] ✓ todo el camino funciona"),
+                Err(e) => {
+                    eprintln!("[selftest] ✗ falló: {e:#}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("help" | "--help" | "-h") => println!("{USAGE}"),
+        Some(word) => match control::Command::parse(word) {
+            Some(command) => match control::send(&paths::socket_path(), command) {
+                Ok(reply) => {
+                    println!("{reply}");
+                    if reply.starts_with("error") {
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{e:#}");
+                    std::process::exit(1);
+                }
+            },
+            None => {
+                eprintln!("comando desconocido: {word}\n\n{USAGE}");
+                std::process::exit(2);
+            }
+        },
+        None => {
+            if logging::redirect_to_file(&paths::log_file()) {
+                println!(
+                    "\n=== stt-md {} arrancó {} ===",
+                    env!("CARGO_PKG_VERSION"),
+                    Local::now().format("%Y-%m-%d %H:%M:%S")
+                );
+            }
+            if let Err(e) = run() {
+                let msg = format!("{e:#}");
+                eprintln!("[stt-md] fatal: {msg}");
+                logging::drain();
+                // Launched as .app there is no terminal: surface the error
+                // visually or the app just silently never appears.
+                show_fatal_alert(&msg);
+                std::process::exit(1);
+            }
+        }
     }
-    let path = paths::log_file();
-    let Ok(file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    else {
-        return;
-    };
-    unsafe {
-        libc::dup2(file.as_raw_fd(), libc::STDOUT_FILENO);
-        libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO);
-    }
-    println!(
-        "\n=== stt-md {} arrancó {} ===",
-        env!("CARGO_PKG_VERSION"),
-        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-    );
 }
 
 /// Record, stop and process without touching the menubar.
@@ -69,8 +116,8 @@ fn redirect_output_to_log() {
 /// binary from the same bundle exercises the whole path under the identity that
 /// actually holds the grants.
 fn selftest(seconds: u64) -> anyhow::Result<()> {
-    let cfg = Arc::new(Config::load_or_init()?);
-    validate_startup(&cfg)?;
+    let cfg = Config::load_or_init()?;
+    cfg.validate()?;
 
     let (session, used_system) = RecordingSession::start_with_fallback()?;
     println!(
@@ -86,34 +133,18 @@ fn selftest(seconds: u64) -> anyhow::Result<()> {
         println!("[selftest] pista del sistema: {}", sys.display());
     }
 
-    let path = process_recording(&output, started_at, 1, &cfg)?;
-    println!("[selftest] nota escrita: {}", path.display());
+    let input = RecordingInput {
+        mic_path: output.mic_path,
+        sys_path: output.sys_path,
+        started_at,
+        duration_min: Some(1),
+        calendar_title: None,
+    };
+    let meeting = pipeline::process(&input, &cfg, &mut |stage| {
+        println!("[selftest] {}", stage.label());
+    })?;
+    println!("[selftest] nota escrita: {}", meeting.note_path.display());
     Ok(())
-}
-
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if let Some(i) = args.iter().position(|a| a == "--selftest") {
-        let seconds = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(20);
-        match selftest(seconds) {
-            Ok(()) => println!("[selftest] ✓ todo el camino funciona"),
-            Err(e) => {
-                eprintln!("[selftest] ✗ falló: {e:#}");
-                std::process::exit(1);
-            }
-        }
-        return;
-    }
-
-    redirect_output_to_log();
-    if let Err(e) = run() {
-        let msg = format!("{e:#}");
-        eprintln!("[stt-md] fatal: {msg}");
-        // Launched as .app there is no terminal: surface the error visually
-        // or the app just silently never appears in the menubar.
-        show_fatal_alert(&msg);
-        std::process::exit(1);
-    }
 }
 
 /// Two copies of the app (the installed one and the build in `dist/`) both
@@ -135,46 +166,6 @@ fn claim_single_instance() -> anyhow::Result<Option<std::fs::File>> {
     }
 }
 
-/// Summary models in the order they are tried. A saved Gemini key turns
-/// Gemini on even when the config doesn't name a model, so setting the key
-/// from the menu is all it takes.
-fn summarizer_chain(cfg: &Config) -> Vec<String> {
-    let cloud = cfg
-        .summary_model
-        .clone()
-        .or_else(|| api_key::gemini_key().map(|_| llm::gemini::DEFAULT_MODEL.to_string()));
-    cloud.into_iter().chain(std::iter::once(cfg.ollama_model.clone())).collect()
-}
-
-fn refresh_key_items(cfg: &Config, summarizer: &MenuItem, key: &MenuItem, remove: &MenuItem) {
-    let has_key = api_key::gemini_key().is_some();
-    let chain = summarizer_chain(cfg);
-    let uses_gemini = chain.first().is_some_and(|m| m.starts_with("gemini-"));
-    summarizer.set_text(match (uses_gemini, has_key) {
-        (true, true) => format!("Resumen: {} (respaldo local)", chain[0]),
-        (true, false) => format!("Resumen: local, falta la API key de {}", chain[0]),
-        (false, _) => format!("Resumen: local ({})", cfg.ollama_model),
-    });
-    key.set_text(if has_key {
-        "Cambiar API key de Gemini…"
-    } else {
-        "Configurar API key de Gemini…"
-    });
-    remove.set_enabled(has_key);
-}
-
-fn refresh_spend_item(item: &MenuItem) {
-    let today = Local::now().date_naive();
-    let t = stt_md::usage::month_total(today);
-    let month = stt_md::usage::month_short_es(today);
-    item.set_text(format!(
-        "Gasto Gemini {month}: US${} · {} resumen{}",
-        format!("{:.2}", t.cost_usd).replace('.', ","),
-        t.calls,
-        if t.calls == 1 { "" } else { "es" }
-    ));
-}
-
 fn configure_gemini_key() {
     let Some(key) = api_key::ask_for_gemini_key() else {
         return;
@@ -194,41 +185,122 @@ fn show_fatal_alert(msg: &str) {
         "display alert \"stt-md no pudo iniciar\" message \"{}\" as critical",
         msg.replace('\\', "\\\\").replace('"', "\\\"")
     );
-    let _ = std::process::Command::new("osascript")
-        .args(["-e", &script])
-        .status();
+    let _ = Command::new("osascript").args(["-e", &script]).status();
 }
 
-fn validate_startup(cfg: &Config) -> anyhow::Result<()> {
-    let model_path = cfg.whisper_model_path();
-    if !model_path.exists() {
-        anyhow::bail!(
-            "No se encontró el modelo Whisper en {}.\n\nDescárgalo con:\ncurl -L -o \"{}\" https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{}",
-            model_path.display(),
-            model_path.display(),
-            cfg.whisper_model_filename
-        );
+fn open(target: &Path) {
+    if let Err(e) = Command::new("open").arg(target).status() {
+        eprintln!("[stt-md] could not open {}: {e}", target.display());
     }
-    match cfg.output_mode {
-        OutputMode::Obsidian => {
-            if !cfg.vault_root.is_dir() {
-                anyhow::bail!(
-                    "vault_root no existe: {}.\n\nCorrige la ruta en {} (o usa output_mode = \"simple\").",
-                    cfg.vault_root.display(),
-                    Config::config_path().display()
-                );
+}
+
+/// Opens a note where it is meant to be read: in Obsidian when it lives in a
+/// vault, with whatever handles Markdown otherwise.
+fn open_note(path: &Path, cfg: &Config) {
+    if cfg.output_mode == OutputMode::Obsidian && path.starts_with(&cfg.vault_root) {
+        let url = format!("obsidian://open?path={}", percent_encode(&path.to_string_lossy()));
+        if Command::new("open").arg(&url).status().is_ok_and(|s| s.success()) {
+            return;
+        }
+    }
+    open(path);
+}
+
+fn percent_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
             }
-        }
-        OutputMode::Simple => {
-            std::fs::create_dir_all(&cfg.output_dir).map_err(|e| {
-                anyhow::anyhow!(
-                    "no se pudo crear output_dir {}: {e}",
-                    cfg.output_dir.display()
-                )
-            })?;
-        }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
+}
+
+fn dir_size(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.metadata().ok())
+                .filter(|m| m.is_file())
+                .map(|m| m.len())
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+fn mmss(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+    } else {
+        format!("{:02}:{:02}", secs / 60, secs % 60)
     }
-    Ok(())
+}
+
+fn duration_min(started: DateTime<Local>, ended: DateTime<Local>) -> i64 {
+    (ended - started).num_minutes().max(1)
+}
+
+/// Why a recording is being stopped.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum StopReason {
+    User,
+    MaxHours,
+    /// Nobody spoke for the configured time; the meeting ended at the last voice.
+    Silence,
+}
+
+/// The recording in progress and the queue entry that will outlive it.
+struct ActiveRecording {
+    session: RecordingSession,
+    job: Job,
+    used_system: bool,
+    silence_notified: bool,
+    remote_missing_notified: bool,
+}
+
+/// The job the worker is on, as the menubar shows it.
+struct InProgress {
+    job: Job,
+    label: String,
+    stage: Stage,
+}
+
+struct App {
+    cfg: SharedConfig,
+    cfg_mtime: Option<SystemTime>,
+    menu: AppMenu,
+    tray: Option<TrayIcon>,
+    /// Whether the menubar currently shows text next to the icon.
+    title_shown: bool,
+
+    state: Arc<Mutex<AppState>>,
+    recording: Option<ActiveRecording>,
+    current_event: calendar_reminder::CurrentEvent,
+
+    queue_dir: std::path::PathBuf,
+    job_tx: Sender<Job>,
+    job_events: Receiver<JobEvent>,
+    /// Jobs handed to the worker that have not finished yet.
+    queued: usize,
+    in_progress: Option<InProgress>,
+    failed: Vec<Job>,
+
+    /// Kept alive: dropping it unregisters the shortcut.
+    _hotkey: Option<GlobalHotKeyManager>,
+    hotkey_label: Option<String>,
+    menu_rx: Receiver<MenuId>,
+    hotkey_rx: Receiver<()>,
+    control_rx: Receiver<control::Request>,
+    /// Held while recording or processing; see [`KeepAwake`].
+    keep_awake: Option<KeepAwake>,
+    key_tx: Sender<()>,
+    key_rx: Receiver<()>,
+
+    last_redraw: Instant,
+    last_config_check: Instant,
+    last_spend_refresh: Instant,
 }
 
 fn run() -> anyhow::Result<()> {
@@ -238,123 +310,475 @@ fn run() -> anyhow::Result<()> {
         OutputMode::Obsidian => println!("[stt-md] mode: obsidian → {}", cfg.vault_root.display()),
         OutputMode::Simple => println!("[stt-md] mode: simple   → {}", cfg.output_dir.display()),
     }
-    validate_startup(&cfg)?;
+    cfg.validate()?;
     // Held for the life of the process: the event loop below never returns.
     let Some(_instance_lock) = claim_single_instance()? else {
         println!("[stt-md] already running, exiting");
         return Ok(());
     };
-    let cfg = Arc::new(cfg);
 
-    let mut event_loop = EventLoop::new();
+    let mut event_loop = EventLoopBuilder::<()>::with_user_event().build();
+    // Whatever happens off the main thread wakes the loop through this
+    // instead of waiting for its timer: an idle menubar app is napped by
+    // macOS, and a napped timer made a `start` take ten seconds to be heard.
+    let proxy = event_loop.create_proxy();
+    let wake = move || {
+        let _ = proxy.send_event(());
+    };
     // Accessory = sin ícono en el Dock ni en Cmd-Tab; solo vive en la menubar.
     // tao fuerza Regular por defecto, pisando el LSUIElement del Info.plist.
     event_loop.set_activation_policy(ActivationPolicy::Accessory);
 
-    let start_item = MenuItem::new("Empezar reunión", true, None);
-    let stop_item = MenuItem::new("Detener", false, None);
-    let separator = PredefinedMenuItem::separator();
-    let summarizer_item = MenuItem::new("", false, None);
-    let spend_item = MenuItem::new("", false, None);
-    refresh_spend_item(&spend_item);
-    let key_item = MenuItem::new("", true, None);
-    let remove_key_item = MenuItem::new("Quitar API key de Gemini", false, None);
-    let separator_2 = PredefinedMenuItem::separator();
-    let quit_item = MenuItem::new("Salir", true, None);
-    refresh_key_items(&cfg, &summarizer_item, &key_item, &remove_key_item);
+    // The shortcut has to be registered from the main thread, with the event
+    // loop already created.
+    let (hotkey_manager, hotkey_label) = register_hotkey(&cfg.hotkey);
+    notifications::set_start_hint(match &hotkey_label {
+        Some(keys) => format!("Pulsa {keys} o usa el menú STT para grabar."),
+        None => String::new(),
+    });
 
-    let mut tray = Some(build_tray(&[
-        &start_item,
-        &stop_item,
-        &separator,
-        &summarizer_item,
-        &spend_item,
-        &key_item,
-        &remove_key_item,
-        &separator_2,
-        &quit_item,
-    ])?);
+    let state = Arc::new(Mutex::new(AppState::Idle));
+    let current_event: calendar_reminder::CurrentEvent = Arc::new(Mutex::new(None));
+    if cfg.meeting_reminder {
+        meeting_detector::spawn(state.clone(), cfg.meeting_reminder_apps.clone());
+        calendar_reminder::spawn(state.clone(), current_event.clone());
+    }
 
-    let menu_channel = MenuEvent::receiver();
-    let start_id = start_item.id().clone();
-    let stop_id = stop_item.id().clone();
-    let key_id = key_item.id().clone();
-    let remove_key_id = remove_key_item.id().clone();
-    let quit_id = quit_item.id().clone();
+    let (menu_tx, menu_rx) = unbounded();
+    MenuEvent::set_event_handler(Some({
+        let wake = wake.clone();
+        move |event: MenuEvent| {
+            let _ = menu_tx.send(event.id);
+            wake();
+        }
+    }));
+    let (hotkey_tx, hotkey_rx) = unbounded();
+    GlobalHotKeyEvent::set_event_handler(Some({
+        let wake = wake.clone();
+        move |event: GlobalHotKeyEvent| {
+            if event.state() == HotKeyState::Pressed {
+                let _ = hotkey_tx.send(());
+                wake();
+            }
+        }
+    }));
+    let (control_tx, control_rx) = unbounded();
+    let served = control::serve(&paths::socket_path(), {
+        let wake = wake.clone();
+        move |request| {
+            let _ = control_tx.send(request);
+            wake();
+        }
+    });
+    if let Err(e) = served {
+        eprintln!("[stt-md] control socket unavailable: {e:#}");
+    }
+
+    let cfg_mtime = config_mtime();
+    let hotkey_text = hotkey_label.is_some().then_some(cfg.hotkey.as_str());
+    let menu = AppMenu::new(hotkey_text)?;
+    let cfg: SharedConfig = Arc::new(RwLock::new(Arc::new(cfg)));
+
+    let queue_dir = paths::queue_dir();
+    let (events_tx, job_events) = unbounded();
+    let job_tx = jobs::spawn_worker(queue_dir.clone(), cfg.clone(), move |event| {
+        let _ = events_tx.send(event);
+        wake();
+    });
     // The key dialog blocks while open, so it runs off the main thread and
     // reports back here; menu items can only be touched from the event loop.
     let (key_tx, key_rx) = unbounded::<()>();
 
-    let state = Arc::new(Mutex::new(AppState::Idle));
-    let session: SessionSlot = Arc::new(Mutex::new(None));
+    let mut app = App {
+        cfg,
+        cfg_mtime,
+        tray: Some(menu.build_tray()?),
+        menu,
+        title_shown: false,
+        state,
+        recording: None,
+        current_event,
+        queue_dir,
+        job_tx,
+        job_events,
+        queued: 0,
+        in_progress: None,
+        failed: Vec::new(),
+        _hotkey: hotkey_manager,
+        hotkey_label,
+        menu_rx,
+        hotkey_rx,
+        control_rx,
+        keep_awake: None,
+        key_tx,
+        key_rx,
+        last_redraw: Instant::now() - REDRAW,
+        last_config_check: Instant::now(),
+        last_spend_refresh: Instant::now(),
+    };
+    app.refresh_summary_items();
+    app.refresh_recent();
+    app.refresh_recordings_item();
+    app.resume_queue();
 
-    if cfg.meeting_reminder {
-        meeting_detector::spawn(state.clone(), cfg.meeting_reminder_apps.clone());
-        calendar_reminder::spawn(state.clone());
+    event_loop.run(move |event, _, control_flow| {
+        // Once per turn of the loop, after whatever woke it was delivered.
+        if !matches!(event, Event::MainEventsCleared) {
+            return;
+        }
+        if app.tick() {
+            *control_flow = ControlFlow::Exit;
+            return;
+        }
+        let sleep = if app.is_busy() { TICK_BUSY } else { TICK_IDLE };
+        *control_flow = ControlFlow::WaitUntil(Instant::now() + sleep);
+    });
+}
+
+fn register_hotkey(spec: &str) -> (Option<GlobalHotKeyManager>, Option<String>) {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return (None, None);
+    }
+    let registered = spec
+        .parse::<HotKey>()
+        .map_err(|e| e.to_string())
+        .and_then(|hotkey| {
+            let manager = GlobalHotKeyManager::new().map_err(|e| e.to_string())?;
+            manager.register(hotkey).map_err(|e| e.to_string())?;
+            Ok(manager)
+        });
+    match registered {
+        Ok(manager) => {
+            let label = pretty_hotkey(spec);
+            println!("[stt-md] global shortcut {label} registered");
+            (Some(manager), Some(label))
+        }
+        Err(e) => {
+            eprintln!("[stt-md] could not register the shortcut «{spec}»: {e}");
+            (None, None)
+        }
+    }
+}
+
+fn config_mtime() -> Option<SystemTime> {
+    std::fs::metadata(Config::config_path()).and_then(|m| m.modified()).ok()
+}
+
+impl App {
+    fn config(&self) -> Arc<Config> {
+        self.cfg.read().clone()
     }
 
-    let (proc_tx, proc_rx): (Sender<ProcessingMsg>, Receiver<ProcessingMsg>) = unbounded();
-
-    // Refresh title + tooltip + stop-item label every ~1s during
-    // recording/processing. tray-icon 0.19 on macOS can't reliably clear a
-    // sticky title once set, so when processing ends the tray is rebuilt
-    // (see the proc_rx handler below).
-    let mut last_tick = Instant::now() - Duration::from_secs(2);
-    let mut silence_notified = false;
-    let mut remote_missing_notified = false;
-    // `resummarize` and `--selftest` spend from other processes too, so the
-    // menu rereads the ledger now and then instead of only after a meeting.
-    let mut last_spend_refresh = Instant::now();
-
-    event_loop.run(move |_event, _, control_flow| {
-        *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(250));
-
-        let st = *state.lock();
-        match st {
-            AppState::Recording { started_at } => {
-                if last_tick.elapsed() >= Duration::from_millis(900) {
-                    let elapsed = started_at.elapsed().as_secs();
-                    let mins = elapsed / 60;
-                    let secs = elapsed % 60;
-                    let timer = format!(" {:02}:{:02}", mins, secs);
-                    if let Some(t) = tray.as_ref() {
-                        t.set_title(Some(timer));
-                        let _ = t.set_tooltip(Some(format!("● grabando {:02}:{:02}", mins, secs)));
-                    }
-                    stop_item.set_text(format!("Detener — {:02}:{:02}", mins, secs));
-                    last_tick = Instant::now();
-                }
+    /// One pass of the event loop. Returns `true` to quit.
+    fn tick(&mut self) -> bool {
+        // First, so a quit from the menu or the socket sees a job the worker
+        // has just finished as finished.
+        while let Ok(event) = self.job_events.try_recv() {
+            self.handle_job_event(event);
+        }
+        while let Ok(id) = self.menu_rx.try_recv() {
+            if let Some(action) = self.menu.action_for(&id)
+                && self.handle(action)
+            {
+                return true;
             }
-            AppState::Processing => {
-                if last_tick.elapsed() >= Duration::from_millis(900) {
-                    if let Some(t) = tray.as_ref() {
-                        t.set_title(Some(" …"));
-                        let _ = t.set_tooltip(Some("Procesando transcripción…"));
-                    }
-                    last_tick = Instant::now();
-                }
+        }
+        while self.hotkey_rx.try_recv().is_ok() {
+            self.toggle();
+        }
+        while let Ok(request) = self.control_rx.try_recv() {
+            if request.command == control::Command::Quit {
+                // Answer first: `quit` ends by waiting for the log, which
+                // also gives the reply time to reach the client.
+                let _ = request.reply.send("cerrando".to_string());
+                self.quit();
+                return true;
             }
-            AppState::Idle => {}
+            let reply = self.handle_command(request.command);
+            let _ = request.reply.send(reply);
+        }
+        while self.key_rx.try_recv().is_ok() {
+            self.refresh_summary_items();
         }
 
-        // Safety net for a forgotten Stop: a recording that ran for two days
-        // produced a 12 GB WAV that never became a note.
-        let mut stop_requested = st.is_recording()
-            && session.lock().as_ref().is_some_and(|(_, started)| {
-                Local::now() - *started >= chrono::Duration::hours(MAX_RECORDING_HOURS)
-            });
+        self.watch_recording();
+
+        if self.last_config_check.elapsed() >= CONFIG_CHECK {
+            self.last_config_check = Instant::now();
+            self.reload_config_if_changed();
+        }
+        // `resummarize` and `--selftest` spend from other processes too, so
+        // the menu rereads the ledger now and then.
+        if self.last_spend_refresh.elapsed() >= SPEND_REFRESH {
+            self.last_spend_refresh = Instant::now();
+            self.refresh_spend_item();
+        }
+        if self.last_redraw.elapsed() >= REDRAW {
+            self.redraw();
+        }
+        self.keep_awake = match (self.is_busy(), self.keep_awake.take()) {
+            (true, held) => held.or_else(|| Some(KeepAwake::begin("grabando o procesando una reunión"))),
+            (false, _) => None,
+        };
+        false
+    }
+
+    /// Recording, or with meetings still to turn into notes.
+    fn is_busy(&self) -> bool {
+        self.recording.is_some() || self.queued > 0
+    }
+
+    /// Returns `true` when the action is to quit.
+    fn handle(&mut self, action: Action) -> bool {
+        let cfg = self.config();
+        match action {
+            Action::Toggle => self.toggle(),
+            Action::OpenNote(path) => open_note(&path, &cfg),
+            Action::Retry(job) => self.retry(job),
+            Action::ShowNotesFolder => open(cfg.notes_root()),
+            Action::EditConfig => {
+                // `-t`: the default text editor, whatever claims .toml.
+                let _ = Command::new("open").arg("-t").arg(Config::config_path()).status();
+            }
+            Action::OpenLog => open(&paths::log_file()),
+            Action::ShowRecordings => open(&paths::recordings_dir()),
+            Action::ConfigureKey => {
+                let tx = self.key_tx.clone();
+                thread::spawn(move || {
+                    configure_gemini_key();
+                    let _ = tx.send(());
+                });
+            }
+            Action::RemoveKey => {
+                match api_key::delete_gemini_key() {
+                    Ok(()) => api_key::show_message(
+                        "stt-md",
+                        "Listo: la API key se borró del Llavero. Las reuniones se van a resumir con el modelo local.",
+                    ),
+                    Err(e) => api_key::show_message("stt-md", &format!("No se pudo borrar: {e:#}")),
+                }
+                self.refresh_summary_items();
+            }
+            Action::Quit => {
+                self.quit();
+                return true;
+            }
+        }
+        false
+    }
+
+    fn handle_command(&mut self, command: control::Command) -> String {
+        use control::Command::*;
+        let recording = self.recording.is_some();
+        match command {
+            Start if recording => "ya estaba grabando".to_string(),
+            Stop if !recording => "no hay grabación en curso".to_string(),
+            Start | Stop | Toggle => {
+                self.toggle();
+                match (recording, self.recording.is_some()) {
+                    (false, true) => "grabando".to_string(),
+                    (true, false) => "detenida; procesando la nota".to_string(),
+                    (false, false) => "error: no se pudo iniciar la grabación".to_string(),
+                    (true, true) => "error: no se pudo detener la grabación".to_string(),
+                }
+            }
+            Status => self.status_json(),
+            // Handled by the caller: it has to stop the event loop.
+            Quit => String::new(),
+        }
+    }
+
+    fn status_json(&self) -> String {
+        serde_json::json!({
+            "recording": self.recording.is_some(),
+            "elapsed_secs": self.recording.as_ref().map(|r| r.session.started_at.elapsed().as_secs()),
+            "system_audio": self.recording.as_ref().map(|r| r.used_system),
+            "queued": self.queued,
+            "processing": self.in_progress.as_ref().map(|p| {
+                serde_json::json!({ "meeting": p.label, "stage": p.stage.label() })
+            }),
+            "failed": self.failed.len(),
+        })
+        .to_string()
+    }
+
+    fn toggle(&mut self) {
+        if self.recording.is_some() {
+            self.stop_recording(StopReason::User);
+        } else {
+            self.start_recording();
+        }
+    }
+
+    fn start_recording(&mut self) {
+        let (session, used_system) = match RecordingSession::start_with_fallback() {
+            Ok(started) => started,
+            Err(e) => {
+                eprintln!("[stt-md] failed to start recording: {e:?}");
+                notifications::recording_failed(&format!("{e:#}"));
+                return;
+            }
+        };
+        sounds::play_start();
+        let calendar_title = self.current_event.lock().clone();
+        println!(
+            "[stt-md] recording started (system audio: {}{})",
+            if used_system { "yes" } else { "no — fallback to mic-only" },
+            calendar_title
+                .as_deref()
+                .map(|t| format!("; calendar: {t}"))
+                .unwrap_or_default()
+        );
+        if !used_system {
+            notifications::system_audio_unavailable();
+        }
+
+        // On record from the first second: if the app dies mid-meeting, this
+        // file is how the next launch knows there is audio to rescue.
+        let (mic_path, sys_path) = session.paths();
+        let job = Job::for_recording(Local::now(), mic_path, sys_path, calendar_title);
+        if let Err(e) = job.save(&self.queue_dir) {
+            eprintln!("[stt-md] could not record job {}: {e:#}", job.id);
+        }
+
+        *self.state.lock() = AppState::Recording { started_at: session.started_at };
+        self.recording = Some(ActiveRecording {
+            session,
+            job,
+            used_system,
+            silence_notified: false,
+            remote_missing_notified: false,
+        });
+        self.redraw();
+    }
+
+    fn stop_recording(&mut self, reason: StopReason) {
+        let Some(active) = self.recording.take() else {
+            return;
+        };
+        sounds::play_stop();
+        *self.state.lock() = AppState::Idle;
+
+        // Wall clock, not Instant: Instant stops while the Mac sleeps,
+        // undercounting long meetings. Stopped for silence, the meeting ended
+        // when the last voice did, not when the app noticed.
+        let ended = match reason {
+            StopReason::Silence => {
+                Local::now() - chrono::Duration::from_std(active.session.silent_for()).unwrap_or_default()
+            }
+            _ => Local::now(),
+        };
+        let mut job = active.job;
+        job.duration_min = Some(duration_min(job.started_at, ended));
+        job.status = JobStatus::Pending;
+
+        match active.session.stop() {
+            Ok(output) => println!(
+                "[stt-md] recording stopped ({reason:?}, {} min, {} tap restarts)",
+                job.duration_min.unwrap_or(0),
+                output.sys_restarts
+            ),
+            // Whatever reached the disk before the writer failed is still a
+            // recording: let the queue try it instead of dropping the meeting.
+            Err(e) => eprintln!("[stt-md] stop error, processing what was written: {e:?}"),
+        }
+        self.enqueue(job);
+        self.redraw();
+    }
+
+    fn enqueue(&mut self, job: Job) {
+        if let Err(e) = job.save(&self.queue_dir) {
+            eprintln!("[stt-md] could not save job {}: {e:#}", job.id);
+        }
+        if self.job_tx.send(job).is_ok() {
+            self.queued += 1;
+        }
+    }
+
+    fn retry(&mut self, mut job: Job) {
+        // A retry asked for by hand starts the crash count over.
+        job.attempts = 0;
+        self.failed.retain(|j| j.id != job.id);
+        self.refresh_failed();
+        println!("[stt-md] job {}: retry requested", job.id);
+        self.enqueue(job);
+        self.redraw();
+    }
+
+    /// Picks up what a previous run left in the queue.
+    fn resume_queue(&mut self) {
+        let recovered = jobs::recover(&self.queue_dir);
+        if !recovered.run.is_empty() {
+            println!("[stt-md] resuming {} unfinished job(s)", recovered.run.len());
+            notifications::recordings_recovered(recovered.run.len());
+        }
+        for job in recovered.run {
+            self.enqueue(job);
+        }
+        self.failed = recovered.failed;
+        self.refresh_failed();
+        if let Some(days) = self.config().keep_recordings_days {
+            jobs::sweep_old_recordings(&paths::recordings_dir(), &self.queue_dir, days, SystemTime::now());
+            self.refresh_recordings_item();
+        }
+    }
+
+    fn handle_job_event(&mut self, event: JobEvent) {
+        match event {
+            JobEvent::Started { job } => {
+                self.in_progress = Some(InProgress { label: job.label(), job, stage: Stage::Loading });
+            }
+            JobEvent::Stage { stage, .. } => {
+                if let Some(p) = self.in_progress.as_mut() {
+                    p.stage = stage;
+                }
+            }
+            JobEvent::Done { meeting, .. } => {
+                self.job_finished();
+                notifications::meeting_saved(&meeting.title, meeting.duration_min, meeting.model.as_deref());
+                if let Some(err) = &meeting.daily_error {
+                    notifications::daily_not_updated(err);
+                }
+                self.refresh_recent();
+                self.refresh_spend_item();
+            }
+            JobEvent::Skipped { reason, .. } => {
+                self.job_finished();
+                notifications::meeting_skipped(&reason);
+            }
+            JobEvent::Failed { job, error } => {
+                self.job_finished();
+                notifications::meeting_failed(&job.label(), &error);
+                self.failed.retain(|j| j.id != job.id);
+                self.failed.push(job);
+                self.refresh_failed();
+            }
+        }
+        self.redraw();
+    }
+
+    fn job_finished(&mut self) {
+        self.queued = self.queued.saturating_sub(1);
+        self.in_progress = None;
+        self.refresh_recordings_item();
+    }
+
+    /// Everything that can go wrong, or go on too long, while recording.
+    fn watch_recording(&mut self) {
+        let auto_stop = Duration::from_secs(self.config().auto_stop_silence_min * 60);
+        let Some(active) = self.recording.as_mut() else {
+            return;
+        };
+
         // A dead system tap is invisible from the outside: the timer keeps
         // running and the WAV keeps growing, only full of zeros. Revive it
         // while the meeting is still happening — afterwards there is nothing
-        // to recover.
-        if let Some((s, _)) = session.lock().as_mut()
-            && s.system_audio_stalled()
-        {
-            match s.restart_system_audio() {
-                Ok(n) => {
-                    println!("[stt-md] system audio went silent; restarted tap (attempt {n})");
-                    notifications::system_audio_restarted();
-                }
+        // to recover. Quietly: most of the time the tap was fine and the
+        // other side was simply not talking.
+        if active.session.system_audio_stalled() {
+            match active.session.restart_system_audio() {
+                Ok(n) => println!("[stt-md] system audio silent while something plays; restarted tap ({n})"),
                 Err(e) => {
                     eprintln!("[stt-md] could not restart system audio: {e:?}");
                     notifications::system_audio_lost();
@@ -365,591 +789,259 @@ fn run() -> anyhow::Result<()> {
         // Nothing is playing and the user keeps talking: the other side is not
         // reaching the output at all, so there is nothing to restart and the
         // only thing that helps is saying so before the meeting ends.
-        if let Some((s, _)) = session.lock().as_ref() {
-            let missing = s.system_audio_missing();
-            if missing && !remote_missing_notified {
-                let mins = recording::SYSTEM_AUDIO_MISSING.as_secs() / 60;
-                println!("[stt-md] nothing on the output for {mins} min while the mic hears voice");
-                notifications::remote_voice_missing(mins);
-            }
-            remote_missing_notified = missing;
+        let missing = active.session.system_audio_missing();
+        if missing && !active.remote_missing_notified {
+            let mins = recording::SYSTEM_AUDIO_MISSING.as_secs() / 60;
+            println!("[stt-md] nothing on the output for {mins} min while the mic hears voice");
+            notifications::remote_voice_missing(mins);
         }
+        active.remote_missing_notified = missing;
 
         // Nudge once per quiet stretch; talking again re-arms the reminder.
-        if let Some((s, _)) = session.lock().as_ref() {
-            let quiet = s.silent_for() >= SILENCE_REMINDER;
-            if quiet && !silence_notified {
-                let mins = SILENCE_REMINDER.as_secs() / 60;
-                println!("[stt-md] no voice for {mins} min while recording");
-                notifications::recording_silent(mins);
+        let silent_for = active.session.silent_for();
+        let quiet = silent_for >= SILENCE_REMINDER;
+        if quiet && !active.silence_notified {
+            let mins = SILENCE_REMINDER.as_secs() / 60;
+            println!("[stt-md] no voice for {mins} min while recording");
+            let until_auto_stop = (auto_stop > SILENCE_REMINDER)
+                .then(|| (auto_stop - SILENCE_REMINDER).as_secs() / 60);
+            notifications::recording_silent(mins, until_auto_stop);
+        }
+        active.silence_notified = quiet;
+
+        let reason = if !auto_stop.is_zero() && silent_for >= auto_stop {
+            Some(StopReason::Silence)
+        } else if Local::now() - active.job.started_at >= chrono::Duration::hours(MAX_RECORDING_HOURS) {
+            // Safety net for a forgotten Stop: a recording that ran for two
+            // days produced a 12 GB WAV that never became a note.
+            Some(StopReason::MaxHours)
+        } else {
+            None
+        };
+        match reason {
+            Some(StopReason::Silence) => {
+                let mins = auto_stop.as_secs() / 60;
+                println!("[stt-md] no voice for {mins} min; stopping automatically");
+                notifications::recording_stopped_for_silence(mins);
             }
-            silence_notified = quiet;
-        }
-
-        if stop_requested {
-            println!("[stt-md] recording hit {MAX_RECORDING_HOURS}h; stopping automatically");
-            notifications::recording_auto_stopped(MAX_RECORDING_HOURS);
-        }
-
-        while let Ok(event) = menu_channel.try_recv() {
-            if event.id == quit_id {
-                if let Some((s, _)) = session.lock().take() {
-                    let _ = s.stop();
-                }
-                tray.take();
-                *control_flow = ControlFlow::Exit;
-            } else if event.id == start_id {
-                let mut st = state.lock();
-                if matches!(*st, AppState::Idle) {
-                    match RecordingSession::start_with_fallback() {
-                        Ok((s, used_system)) => {
-                            sounds::play_start();
-                            let started_at = s.started_at;
-                            let now = Local::now();
-                            *session.lock() = Some((s, now));
-                            *st = AppState::Recording { started_at };
-                            start_item.set_enabled(false);
-                            stop_item.set_enabled(true);
-                            stop_item.set_text("Detener — 00:00");
-                            let label = if used_system {
-                                "● grabando (mic + sistema)"
-                            } else {
-                                "● grabando (solo mic)"
-                            };
-                            if let Some(t) = tray.as_ref() {
-                                t.set_title(Some(" 00:00"));
-                                let _ = t.set_tooltip(Some(format!("{label} 00:00")));
-                            }
-                            println!(
-                                "[stt-md] recording started (system audio: {})",
-                                if used_system { "yes" } else { "no — fallback to mic-only" }
-                            );
-                            if !used_system {
-                                notifications::system_audio_unavailable();
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("[stt-md] failed to start recording: {e:?}");
-                            notifications::recording_failed(&format!("{e:#}"));
-                        }
-                    }
-                }
-            } else if event.id == stop_id {
-                stop_requested = true;
-            } else if event.id == key_id {
-                let tx = key_tx.clone();
-                thread::spawn(move || {
-                    configure_gemini_key();
-                    let _ = tx.send(());
-                });
-            } else if event.id == remove_key_id {
-                match api_key::delete_gemini_key() {
-                    Ok(()) => api_key::show_message(
-                        "stt-md",
-                        "Listo: la API key se borró del Llavero. Las reuniones se van a resumir con el modelo local.",
-                    ),
-                    Err(e) => api_key::show_message("stt-md", &format!("No se pudo borrar: {e:#}")),
-                }
-                refresh_key_items(&cfg, &summarizer_item, &key_item, &remove_key_item);
+            Some(StopReason::MaxHours) => {
+                println!("[stt-md] recording hit {MAX_RECORDING_HOURS}h; stopping automatically");
+                notifications::recording_auto_stopped(MAX_RECORDING_HOURS);
             }
+            _ => {}
         }
-
-        if last_spend_refresh.elapsed() >= Duration::from_secs(60) {
-            refresh_spend_item(&spend_item);
-            last_spend_refresh = Instant::now();
+        if let Some(reason) = reason {
+            self.stop_recording(reason);
         }
-
-        while key_rx.try_recv().is_ok() {
-            refresh_key_items(&cfg, &summarizer_item, &key_item, &remove_key_item);
-        }
-
-        if stop_requested {
-            let mut st = state.lock();
-            if st.is_recording()
-                && let Some((s, started_at_local)) = session.lock().take()
-            {
-                sounds::play_stop();
-                // Wall clock, not Instant: Instant stops while the Mac
-                // sleeps, undercounting long meetings.
-                let duration_min = (Local::now() - started_at_local)
-                    .num_minutes()
-                    .max(1);
-                match s.stop() {
-                    Ok(recording) => {
-                        println!("[stt-md] saved {}", recording.mic_path.display());
-                        if let Some(sys) = &recording.sys_path {
-                            println!("[stt-md] saved {}", sys.display());
-                        }
-                        *st = AppState::Processing;
-                        start_item.set_enabled(false);
-                        stop_item.set_enabled(false);
-                        stop_item.set_text("Procesando…");
-                        if let Some(t) = tray.as_ref() {
-                            let _ = t.set_tooltip(Some(
-                                "Procesando transcripción…".to_string(),
-                            ));
-                        }
-                        last_tick = Instant::now() - Duration::from_secs(2);
-
-                        let proc_tx_clone = proc_tx.clone();
-                        let cfg_clone = cfg.clone();
-                        thread::spawn(move || {
-                            let msg = match process_recording(
-                                &recording,
-                                started_at_local,
-                                duration_min,
-                                &cfg_clone,
-                            ) {
-                                Ok(p) => ProcessingMsg::Done(p),
-                                Err(e) => {
-                                    eprintln!("[stt-md] processing error: {e:?}");
-                                    ProcessingMsg::Failed(e.to_string())
-                                }
-                            };
-                            let _ = proc_tx_clone.send(msg);
-                        });
-                    }
-                    Err(e) => {
-                        eprintln!("[stt-md] stop error: {e:?}");
-                        *st = AppState::Idle;
-                        start_item.set_enabled(true);
-                        stop_item.set_enabled(false);
-                    }
-                }
-            }
-        }
-
-        while let Ok(msg) = proc_rx.try_recv() {
-            match msg {
-                ProcessingMsg::Done(path) => {
-                    println!("[stt-md] wrote {}", path.display());
-                    notifications::meeting_saved(&path);
-                }
-                ProcessingMsg::Failed(err) => {
-                    eprintln!("[stt-md] processing failed: {err}");
-                    notifications::meeting_failed(&err);
-                }
-            }
-            *state.lock() = AppState::Idle;
-            refresh_spend_item(&spend_item);
-            start_item.set_enabled(true);
-            stop_item.set_enabled(false);
-            stop_item.set_text("Detener");
-            // Drop + rebuild the TrayIcon to clear the sticky " …" title.
-            // tray-icon 0.19 macOS has no working API to clear once a title
-            // is set; only fully recreating the NSStatusItem works.
-            tray.take();
-            match build_tray(&[
-                &start_item,
-                &stop_item,
-                &separator,
-                &summarizer_item,
-                &spend_item,
-                &key_item,
-                &remove_key_item,
-                &separator_2,
-                &quit_item,
-            ]) {
-                Ok(t) => {
-                    let _ = t.set_tooltip(Some("stt-md".to_string()));
-                    tray = Some(t);
-                }
-                Err(e) => eprintln!("[stt-md] failed to rebuild tray: {e:?}"),
-            }
-            last_tick = Instant::now() - Duration::from_secs(2);
-        }
-    });
-}
-
-fn build_tray(items: &[&dyn tray_icon::menu::IsMenuItem]) -> anyhow::Result<tray_icon::TrayIcon> {
-    let menu = Menu::new();
-    menu.append_items(items)?;
-    Ok(TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
-        .with_icon(build_idle_icon())
-        .with_tooltip("stt-md")
-        .with_icon_as_template(true)
-        .build()?)
-}
-
-fn load_track_16k(wav_path: &std::path::Path) -> anyhow::Result<Vec<f32>> {
-    let t0 = Instant::now();
-    let resampled = audio_utils::load_wav_16k_mono(wav_path)?;
-    println!(
-        "[stt-md] loaded {:.1}s from {} in {}ms",
-        resampled.len() as f32 / 16_000.0,
-        wav_path.display(),
-        t0.elapsed().as_millis()
-    );
-    Ok(resampled)
-}
-
-fn process_recording(
-    recording: &RecordingOutput,
-    started_at_local: DateTime<Local>,
-    duration_min: i64,
-    cfg: &Config,
-) -> anyhow::Result<PathBuf> {
-    let mic_samples = load_track_16k(&recording.mic_path)?;
-    let sys_samples = recording
-        .sys_path
-        .as_deref()
-        .map(load_track_16k)
-        .transpose()?;
-
-    // A track shorter than 1s has nothing transcribable (e.g. system audio of
-    // a meeting where nobody else spoke). Skip it; only bail if every track
-    // is empty.
-    let mic_ok = mic_samples.len() >= 16_000;
-    let sys_ok = sys_samples.as_ref().is_some_and(|s| s.len() >= 16_000);
-    if !mic_ok && !sys_ok {
-        anyhow::bail!(
-            "la grabación dura menos de 1 segundo; no hay nada que transcribir (audio: {})",
-            recording.mic_path.display()
-        );
     }
 
-    // Load per recording instead of caching: keeping large-v3-turbo resident
-    // costs ~1.5 GB of RAM forever; reloading adds only a few seconds to a
-    // 30-60 s pipeline.
-    let model_path = cfg.whisper_model_path();
-    println!("[stt-md] loading whisper model from {}", model_path.display());
-    let t0 = Instant::now();
-    let engine = WhisperEngine::load(&model_path)?;
-    println!("[stt-md] model loaded in {}ms", t0.elapsed().as_millis());
-
-    let transcribe = |samples: &[f32], label: &str| -> anyhow::Result<Vec<transcription::TranscriptSegment>> {
-        let t0 = Instant::now();
-        let segs = engine.transcribe(
-            samples,
-            &cfg.whisper_language,
-            cfg.whisper_initial_prompt.as_deref(),
-        )?;
-        println!(
-            "[stt-md] transcribed {} ({} segments) in {}ms",
-            label,
-            segs.len(),
-            t0.elapsed().as_millis()
-        );
-        Ok(segs)
-    };
-
-    let mic_segments = if mic_ok {
-        transcribe(&mic_samples, "mic")?
-    } else {
-        Vec::new()
-    };
-
-    let segments = match &sys_samples {
-        // Two tracks: transcribe each separately and interleave with speaker
-        // labels — mixing them into one stream loses who spoke and clips.
-        Some(sys) if sys_ok => {
-            let sys_segments = transcribe(sys, "system")?;
-            transcription::merge_segments(mic_segments, sys_segments)
+    /// An edit to the config file applies to the next meeting without a
+    /// relaunch. A file that doesn't parse leaves the previous one in force.
+    fn reload_config_if_changed(&mut self) {
+        let mtime = config_mtime();
+        if mtime == self.cfg_mtime {
+            return;
         }
-        // System track present but empty → keep mic unlabeled (labels would
-        // be noise when there is only one voice source in the note).
-        _ => mic_segments,
-    };
+        self.cfg_mtime = mtime;
+        match Config::load_or_init().and_then(|cfg| cfg.validate().map(|()| cfg)) {
+            Ok(cfg) => {
+                println!("[stt-md] config reloaded");
+                *self.cfg.write() = Arc::new(cfg);
+                self.refresh_summary_items();
+            }
+            Err(e) => {
+                eprintln!("[stt-md] config not reloaded: {e:#}");
+                notifications::config_invalid(&format!("{e:#}"));
+            }
+        }
+    }
 
-    // A tap that died mid-meeting leaves the note looking like a monologue.
-    // Say it out loud — in the note and to the summarizer — instead of letting
-    // a model fill the gap with people and deadlines nobody mentioned.
-    let audio_warning = sys_samples
-        .as_ref()
-        .and_then(|s| audio_utils::dead_air(s, 16_000))
-        .map(|(at, run)| {
+    fn quit(&mut self) {
+        // A recording in progress is closed and left in the queue: the next
+        // launch turns it into its note.
+        if let Some(active) = self.recording.take() {
+            let mut job = active.job;
+            job.duration_min = Some(duration_min(job.started_at, Local::now()));
+            job.status = JobStatus::Pending;
+            if let Err(e) = active.session.stop() {
+                eprintln!("[stt-md] stop error on quit: {e:?}");
+            }
+            let _ = job.save(&self.queue_dir);
+            println!("[stt-md] quitting mid-recording; job {} stays queued", job.id);
+        }
+        // The job being processed counted an attempt when it began, which is
+        // how a meeting that crashes the app every time is caught. Quitting
+        // is not a crash: give the attempt back, or three quits during a
+        // long summary park a healthy meeting as failed.
+        // Only while its file is still there: a job the worker just finished
+        // must not come back to life and write its note a second time.
+        if let Some(InProgress { job, .. }) = self.in_progress.take()
+            && self.queue_dir.join(format!("{}.json", job.id)).exists()
+        {
+            let mut job = job;
+            job.attempts = job.attempts.saturating_sub(1);
+            job.status = JobStatus::Pending;
+            let _ = job.save(&self.queue_dir);
+        }
+        if self.queued > 0 {
             println!(
-                "[stt-md] system track flatlined at {:.0}s for {:.0}s",
-                at, run
+                "[stt-md] quitting with {} job(s) unfinished; they resume on next launch",
+                self.queued
             );
-            format!(
-                "El audio del sistema se cortó en {:02}:{:02} y no volvió: desde ahí solo hay micrófono, la otra voz falta o aparece atribuida a «yo», y el resumen cubre nada más que la primera parte.",
-                (at as u64) / 60,
-                (at as u64) % 60
-            )
-        });
-
-    let mut transcript_text: String = segments.iter().map(format_transcript_line).collect();
-    if let Some(warning) = &audio_warning {
-        transcript_text.insert_str(0, &format!("[aviso del grabador: {warning}]\n\n"));
-    }
-
-    match cfg.output_mode {
-        OutputMode::Obsidian => process_obsidian_mode(
-            cfg,
-            recording,
-            started_at_local,
-            duration_min,
-            &segments,
-            &transcript_text,
-            audio_warning.as_deref(),
-        ),
-        OutputMode::Simple => process_simple_mode(
-            cfg,
-            recording,
-            started_at_local,
-            duration_min,
-            &segments,
-            &transcript_text,
-        ),
-    }
-}
-
-fn format_transcript_line(s: &transcription::TranscriptSegment) -> String {
-    let mins = s.start_ms / 60_000;
-    let secs = (s.start_ms % 60_000) / 1000;
-    match s.speaker {
-        Some(sp) => format!("[{:02}:{:02}] {}: {}\n", mins, secs, sp.label(), s.text),
-        None => format!("[{:02}:{:02}] {}\n", mins, secs, s.text),
-    }
-}
-
-fn process_obsidian_mode(
-    cfg: &Config,
-    recording: &RecordingOutput,
-    started_at_local: DateTime<Local>,
-    duration_min: i64,
-    segments: &[transcription::TranscriptSegment],
-    transcript_text: &str,
-    audio_warning: Option<&str>,
-) -> anyhow::Result<PathBuf> {
-    let vault_root = cfg.vault_root.as_path();
-
-    let t0 = Instant::now();
-    let vocab = vault::scanner::scan_vault(vault_root)?;
-    let areas = cfg
-        .areas_dir
-        .as_deref()
-        .map(|d| vault::scanner::scan_areas(vault_root, d))
-        .unwrap_or_default();
-    println!(
-        "[stt-md] scanned vault in {}ms ({} tags / {} wikilinks / {} areas)",
-        t0.elapsed().as_millis(),
-        vocab.frontmatter_tags.len() + vocab.inline_tags.len(),
-        vocab.wikilink_targets.len(),
-        areas.len()
-    );
-
-    let prompt = llm::prompts::build_summary_prompt(transcript_text, &vocab, &areas);
-
-    println!(
-        "[stt-md] summarizing with {} — this can take 20-60s…",
-        summarizer_chain(cfg).join(" → ")
-    );
-    // The transcript must survive a bad summary: a cloud model can be out of
-    // reach and a 7B model returns broken JSON often enough. Each model in
-    // the chain gets its turn, and if all fail the note is written with the
-    // transcript and says why it has no summary.
-    let mut summary =
-        llm::summarize_with_fallback(
-            &prompt,
-            &summarizer_chain(cfg).iter().map(String::as_str).collect::<Vec<_>>(),
-            &cfg.ollama_url,
-        );
-    summary.enforce_vocab(&vocab);
-    summary.enforce_area(&areas);
-    summary.enforce_grounding(transcript_text);
-
-    let meetings_dir_rel = vault::expand_pattern(&cfg.meetings_dir, &started_at_local);
-    let daily_note_rel = vault::expand_pattern(&cfg.daily_note, &started_at_local);
-    let daily_template = cfg
-        .daily_template
-        .as_deref()
-        .and_then(|rel| std::fs::read_to_string(vault_root.join(rel)).ok());
-
-    let written = vault::meeting_writer::write_meeting(
-        vault_root,
-        &meetings_dir_rel,
-        started_at_local,
-        &summary,
-        segments,
-        duration_min,
-        &vault::meeting_writer::AudioContext {
-            mic_path: &recording.mic_path,
-            sys_path: recording.sys_path.as_deref(),
-            warning: audio_warning,
-        },
-    )?;
-    println!("[stt-md] wrote meeting to {}", written.absolute_path.display());
-
-    let daily_path = vault::daily_appender::append_meeting_link(
-        vault_root,
-        &daily_note_rel,
-        daily_template.as_deref(),
-        started_at_local,
-        &summary.title,
-        &written.stem,
-        duration_min,
-    )?;
-    println!("[stt-md] updated daily {}", daily_path.display());
-
-    Ok(written.absolute_path)
-}
-
-fn process_simple_mode(
-    cfg: &Config,
-    recording: &RecordingOutput,
-    started_at_local: DateTime<Local>,
-    duration_min: i64,
-    segments: &[transcription::TranscriptSegment],
-    transcript_text: &str,
-) -> anyhow::Result<PathBuf> {
-    let prompt = llm::prompts::build_simple_summary_prompt(transcript_text);
-
-    println!(
-        "[stt-md] calling Ollama ({}) — simple mode…",
-        cfg.ollama_model
-    );
-    let t0 = Instant::now();
-    let raw = llm::ollama::generate_json(&prompt, &cfg.ollama_model, &cfg.ollama_url)?;
-    println!("[stt-md] ollama replied in {}ms", t0.elapsed().as_millis());
-
-    let mut summary: llm::MeetingSummary = serde_json::from_str(&raw)
-        .map_err(|e| anyhow::anyhow!("ollama returned invalid JSON: {e}\n--- raw ---\n{raw}"))?;
-    summary.normalize_simple(4);
-    summary.enforce_grounding(transcript_text);
-
-    let path = vault::simple_writer::write_simple(
-        cfg.output_dir.as_path(),
-        started_at_local,
-        &summary,
-        segments,
-        duration_min,
-        &recording.mic_path,
-        recording.sys_path.as_deref(),
-    )?;
-    println!("[stt-md] wrote {}", path.display());
-
-    Ok(path)
-}
-
-/// Hard cap on a single recording; beyond this the Stop was forgotten.
-const MAX_RECORDING_HOURS: i64 = 4;
-/// Quiet time after which a still-running recording is probably a forgotten
-/// Stop (meeting over, laptop left open).
-const SILENCE_REMINDER: Duration = Duration::from_secs(5 * 60);
-
-const APP_ICON_PNG: &[u8] = include_bytes!("../assets/icon-256.png");
-const TRAY_ICON_SIZE: u32 = 20;
-
-fn build_idle_icon() -> Icon {
-    match glyph_icon_from_png(APP_ICON_PNG, TRAY_ICON_SIZE) {
-        Ok(icon) => icon,
-        Err(e) => {
-            eprintln!("[stt-md] failed to build tray icon from app icon: {e:?}");
-            fallback_idle_icon()
         }
+        let _ = std::fs::remove_file(paths::socket_path());
+        self.tray.take();
+        logging::drain();
     }
-}
 
-/// Extracts the light glyph (waveform + text lines) from the app icon and
-/// turns it into a monochrome template image: luminance → alpha, so the dark
-/// tile background disappears and macOS tints it for light/dark menubars.
-fn glyph_icon_from_png(png_bytes: &[u8], size: u32) -> anyhow::Result<Icon> {
-    let decoder = png::Decoder::new(png_bytes);
-    let mut reader = decoder.read_info()?;
-    let mut buf = vec![0u8; reader.output_buffer_size()];
-    let info = reader.next_frame(&mut buf)?;
-    let (w, h) = (info.width as usize, info.height as usize);
-    let bpp = match info.color_type {
-        png::ColorType::Rgba => 4,
-        png::ColorType::Rgb => 3,
-        other => anyhow::bail!("unsupported app-icon color type: {other:?}"),
-    };
-    anyhow::ensure!(info.bit_depth == png::BitDepth::Eight, "expected 8-bit png");
+    // --- what the menubar shows ---------------------------------------------
 
-    // Per-source-pixel glyph alpha, then area-average downscale for smooth edges.
-    let glyph_alpha = |x: usize, y: usize| -> f32 {
-        let p = (y * w + x) * bpp;
-        let (r, g, b) = (buf[p] as f32, buf[p + 1] as f32, buf[p + 2] as f32);
-        let a = if bpp == 4 { buf[p + 3] as f32 / 255.0 } else { 1.0 };
-        let lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-        // Tile background is dark navy (lum ≈ 20-40); glyph is near-white.
-        (((lum - 60.0) / 80.0).clamp(0.0, 1.0)) * a
-    };
+    fn processing_line(&self) -> Option<String> {
+        if self.queued == 0 {
+            return None;
+        }
+        let waiting = match self.queued.saturating_sub(1) {
+            0 => String::new(),
+            n => format!(" (+{n} en cola)"),
+        };
+        Some(match &self.in_progress {
+            Some(p) => format!("Procesando reunión del {}: {}{waiting}", p.label, p.stage.label()),
+            None => format!("Procesando{waiting}…"),
+        })
+    }
 
-    // Crop to the glyph's (square, centered) bounding box: the tile has a lot
-    // of padding and the glyph would come out tiny at menubar size.
-    let (mut bx0, mut bx1, mut by0, mut by1) = (w, 0usize, h, 0usize);
-    for y in 0..h {
-        for x in 0..w {
-            if glyph_alpha(x, y) > 0.5 {
-                bx0 = bx0.min(x);
-                bx1 = bx1.max(x);
-                by0 = by0.min(y);
-                by1 = by1.max(y);
+    fn redraw(&mut self) {
+        self.last_redraw = Instant::now();
+        let processing = self.processing_line();
+
+        let (title, status) = match &self.recording {
+            Some(active) => {
+                let timer = mmss(active.session.started_at.elapsed().as_secs());
+                self.menu.toggle.set_text(format!("Detener — {timer}"));
+                let source = if active.used_system { "mic + sistema" } else { "solo mic" };
+                let mut status = format!("● Grabando {timer} ({source})");
+                if let Some(p) = &processing {
+                    status.push_str(&format!(" · {}", p.to_lowercase()));
+                }
+                (Some(format!(" {timer}")), status)
             }
-        }
-    }
-    anyhow::ensure!(bx0 <= bx1 && by0 <= by1, "no glyph pixels found in app icon");
-    let side = (bx1 - bx0 + 1).max(by1 - by0 + 1);
-    let cx = (bx0 + bx1) / 2;
-    let cy = (by0 + by1) / 2;
-    let ox0 = cx.saturating_sub(side / 2) as isize;
-    let oy0 = cy.saturating_sub(side / 2) as isize;
-
-    let out_px = size as usize;
-    let mut rgba = vec![0u8; out_px * out_px * 4];
-    for oy in 0..out_px {
-        let (y0, y1) = (oy * side / out_px, ((oy + 1) * side / out_px).max(oy * side / out_px + 1));
-        for ox in 0..out_px {
-            let (x0, x1) = (ox * side / out_px, ((ox + 1) * side / out_px).max(ox * side / out_px + 1));
-            let mut acc = 0.0;
-            for sy in y0..y1 {
-                for sx in x0..x1 {
-                    let (ix, iy) = (ox0 + sx as isize, oy0 + sy as isize);
-                    if ix >= 0 && (ix as usize) < w && iy >= 0 && (iy as usize) < h {
-                        acc += glyph_alpha(ix as usize, iy as usize);
+            None => {
+                self.menu.toggle.set_text("Empezar reunión");
+                let title = processing.as_ref().map(|_| match &self.in_progress {
+                    Some(InProgress { stage: Stage::Transcribing { percent }, .. }) => {
+                        format!(" {percent}%")
                     }
+                    _ => " …".to_string(),
+                });
+                let status = processing.unwrap_or_else(|| match &self.hotkey_label {
+                    Some(keys) => format!("Listo para grabar · {keys}"),
+                    None => "Listo para grabar".to_string(),
+                });
+                (title, status)
+            }
+        };
+        self.menu.status.set_text(&status);
+
+        match title {
+            Some(title) => {
+                if let Some(tray) = self.tray.as_ref() {
+                    tray.set_title(Some(title));
+                    let _ = tray.set_tooltip(Some(status));
+                }
+                self.title_shown = true;
+            }
+            // tray-icon 0.19 on macOS has no working way to clear a title
+            // once set; only recreating the NSStatusItem does.
+            None if self.title_shown => {
+                self.title_shown = false;
+                self.tray.take();
+                match self.menu.build_tray() {
+                    Ok(tray) => self.tray = Some(tray),
+                    Err(e) => eprintln!("[stt-md] failed to rebuild tray: {e:?}"),
                 }
             }
-            let avg = acc / ((y1 - y0) * (x1 - x0)) as f32;
-            let idx = (oy * out_px + ox) * 4;
-            rgba[idx + 3] = (avg * 255.0).round() as u8;
+            None => {}
         }
     }
-    Icon::from_rgba(rgba, size, size).map_err(|e| anyhow::anyhow!("bad rgba: {e}"))
-}
 
-fn fallback_idle_icon() -> Icon {
-    // 20x20. "STT" en pixel art (5x7 por letra, separador 1px).
-    let pattern: [&str; 20] = [
-        "....................",
-        "....................",
-        "....................",
-        "....................",
-        "....................",
-        "....................",
-        "..####.#####.#####..",
-        ".#........#.....#...",
-        ".#........#.....#...",
-        "..###.....#.....#...",
-        ".....#....#.....#...",
-        ".....#....#.....#...",
-        ".####.....#.....#...",
-        "....................",
-        "....................",
-        "....................",
-        "....................",
-        "....................",
-        "....................",
-        "....................",
-    ];
-    rgba_from_pattern(&pattern)
-}
+    fn refresh_summary_items(&self) {
+        let cfg = self.config();
+        let has_key = api_key::gemini_key().is_some();
+        let chain = cfg.summary_models();
+        let uses_gemini = chain.first().is_some_and(|m| m.starts_with("gemini-"));
+        self.menu.summarizer.set_text(match (uses_gemini, has_key) {
+            (true, true) => format!("Resumen: {} (respaldo local)", chain[0]),
+            (true, false) => format!("Resumen: local, falta la API key de {}", chain[0]),
+            (false, _) => format!("Resumen: local ({})", cfg.ollama_model),
+        });
+        self.menu.key.set_text(if has_key {
+            "Cambiar API key de Gemini…"
+        } else {
+            "Configurar API key de Gemini…"
+        });
+        self.menu.remove_key.set_enabled(has_key);
+        self.refresh_spend_item();
+    }
 
-fn rgba_from_pattern(pattern: &[&str]) -> Icon {
-    let size = pattern.len() as u32;
-    debug_assert!(pattern.iter().all(|r| r.chars().count() == size as usize));
-    let mut rgba = vec![0u8; (size * size * 4) as usize];
-    for (y, row) in pattern.iter().enumerate() {
-        for (x, ch) in row.chars().enumerate() {
-            if ch == '#' {
-                let idx = ((y as u32 * size + x as u32) * 4) as usize;
-                rgba[idx + 3] = 255;
-            }
+    fn refresh_spend_item(&self) {
+        let today = Local::now().date_naive();
+        let t = usage::month_total(today);
+        self.menu.spend.set_text(format!(
+            "Gasto Gemini {}: US${} · {} resumen{}",
+            usage::month_short_es(today),
+            format!("{:.2}", t.cost_usd).replace('.', ","),
+            t.calls,
+            if t.calls == 1 { "" } else { "es" }
+        ));
+    }
+
+    fn refresh_recent(&mut self) {
+        self.menu.set_recent(&history::recent(RECENT_NOTES));
+    }
+
+    fn refresh_failed(&mut self) {
+        if self.menu.set_failed(&self.failed)
+            && let Some(tray) = self.tray.as_ref()
+        {
+            self.menu.apply(tray);
         }
     }
-    Icon::from_rgba(rgba, size, size).expect("valid RGBA buffer")
+
+    fn refresh_recordings_item(&self) {
+        let gb = dir_size(&paths::recordings_dir()) as f64 / 1e9;
+        self.menu.recordings.set_text(format!(
+            "Mostrar grabaciones ({} GB)",
+            format!("{gb:.1}").replace('.', ",")
+        ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn note_paths_survive_the_trip_through_an_obsidian_url() {
+        assert_eq!(
+            percent_encode("/Users/x/vault/notas/semana-46/reunión de año.md"),
+            "%2FUsers%2Fx%2Fvault%2Fnotas%2Fsemana-46%2Freuni%C3%B3n%20de%20a%C3%B1o.md"
+        );
+    }
+
+    #[test]
+    fn timers_grow_an_hour_field_only_when_needed() {
+        assert_eq!(mmss(0), "00:00");
+        assert_eq!(mmss(754), "12:34");
+        assert_eq!(mmss(3_725), "1:02:05");
+    }
+
+    #[test]
+    fn a_meeting_lasts_at_least_a_minute() {
+        let start = Local.with_ymd_and_hms(2026, 11, 10, 17, 0, 0).unwrap();
+        assert_eq!(duration_min(start, start + chrono::Duration::seconds(20)), 1);
+        assert_eq!(duration_min(start, start + chrono::Duration::minutes(63)), 63);
+        // A clock that jumped back must not produce a negative duration.
+        assert_eq!(duration_min(start, start - chrono::Duration::minutes(5)), 1);
+    }
 }

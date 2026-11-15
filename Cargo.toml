@@ -1,6 +1,6 @@
 [package]
 name = "stt-md"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 description = "Lightweight macOS menubar app: mic → whisper → Ollama summary → Obsidian vault"
 license = "MIT"
@@ -46,10 +46,11 @@ notify-rust = "4"
 toml = "0.8"
 anyhow = "1"
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSArray", "NSDate", "NSError", "NSPredicate", "NSString", "NSURL"] }
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSDate", "NSError", "NSPredicate", "NSProcessInfo", "NSString", "NSURL"] }
 block2 = "0.6"
 objc2-event-kit = { version = "0.3", default-features = false, features = ["std", "block2", "EKEventStore", "EKEvent", "EKCalendar", "EKCalendarItem", "EKObject", "EKParticipant", "EKTypes"] }
 libc = "0.2.189"
+global-hotkey = "0.10"
 
 [profile.release]
 opt-level = 3

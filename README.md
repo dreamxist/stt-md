@@ -25,14 +25,20 @@ A 3 MB macOS menubar app that turns your meetings into structured Markdown notes
 └───────────────────────────────────────────────────┬─────────┘
                                                     │ click
                                                     ▼
-                            ┌─────────────────────────────┐
-                            │ ● grabando 12:34            │
-                            │ ─────────────────────────── │
-                            │ Empezar reunión             │
-                            │ Detener — 12:34             │
-                            │ ─────────────────────────── │
-                            │ Salir                       │
-                            └─────────────────────────────┘
+              ┌────────────────────────────────────────────────┐
+              │ ● Grabando 12:34 (mic + sistema) · procesando   │
+              │   reunión del 10 nov 11:03: transcribiendo 42%  │
+              │ Detener — 12:34                          ⌃⌥⌘R  │
+              │ ────────────────────────────────────────────── │
+              │ Abrir última nota: Seguimiento de desembolsos   │
+              │ Notas recientes                              ▸ │
+              │ ⚠ Sin procesar (1)                           ▸ │
+              │ ────────────────────────────────────────────── │
+              │ Resumen                                      ▸ │
+              │ Ajustes                                      ▸ │
+              │ ────────────────────────────────────────────── │
+              │ Salir                                           │
+              └────────────────────────────────────────────────┘
 ```
 
 ## Pipeline
@@ -184,23 +190,54 @@ meeting_reminder = true   # default; set to false to disable
 # meeting_reminder_apps = ["us.zoom.xos", "com.google.chrome"]
 ```
 
-It notifies once per meeting and never while already recording. If the mic grab happens while the previous recording is still post-processing, the reminder fires as soon as the app is idle again instead of being dropped. Short mic drops (<30 s — device switches, reconnects) don't count as a new meeting. On macOS < 14 the detector is silently inactive.
+It notifies once per meeting and never while already recording. A call is told apart from a voice note by playback: an app that holds the mic *and* plays audio for a few seconds is a call and gets the reminder right away; one that only records (a WhatsApp voice message) has to hold the mic for 45 s first. Short mic drops (<30 s — device switches, reconnects) don't count as a new meeting. On macOS < 14 the detector is silently inactive.
+
+With calendar access granted, the event that is on when you hit record goes along with the recording: the summarizer gets its title as a hint and the note carries it as `event:`.
+
+### Shortcut, CLI and automation
+
+```toml
+hotkey = "ctrl+alt+cmd+r"   # default; "" disables it. Read at launch.
+```
+
+The shortcut starts and stops a recording from any app. The same thing is available from a terminal — or Raycast, Shortcuts, a Stream Deck — through the app's own binary, which talks to the running instance over a Unix socket:
+
+```bash
+/Applications/stt-md.app/Contents/MacOS/stt-md toggle   # or: start | stop
+/Applications/stt-md.app/Contents/MacOS/stt-md status   # JSON: recording, queue, stage
+/Applications/stt-md.app/Contents/MacOS/stt-md quit     # what was recording stays queued
+```
+
+### Stopping and housekeeping
+
+```toml
+auto_stop_silence_min = 15   # default; 0 disables it
+# keep_recordings_days = 30  # default: keep every WAV forever
+```
+
+A recording with no voice on either track for `auto_stop_silence_min` minutes stops by itself and its note is processed; the duration ends at the last voice. A reminder comes first, at 5 minutes. `keep_recordings_days` deletes old WAVs (an hour of meeting is about 500 MB); recordings still waiting to become a note are never deleted.
+
+Edits to `config.toml` apply to the next meeting without relaunching (menu → Ajustes → Editar configuración…). A file that doesn't parse leaves the previous settings in force and says so.
 
 ## Usage
 
-1. Click `STT` in the menubar → **"Empezar reunión"** (Spanish UI; PRs welcome for translations).
+1. Press the shortcut, or click `STT` in the menubar → **"Empezar reunión"** (Spanish UI; PRs welcome for translations).
 2. Talk. The icon shows `STT 12:34` in real time.
-3. Click **"Detener"** → icon switches to `STT …`. Behind the scenes:
-   - Audio is downmixed to mono and resampled to 16 kHz.
-   - Whisper transcribes in batch with Metal acceleration.
+3. Press the shortcut again, or **"Detener"**. The note is made in the background — the menu shows the stage and the percentage — and you can start recording the next meeting right away:
+   - Each track is low-passed and resampled to 16 kHz.
+   - Whisper transcribes with Metal acceleration, mic and system audio separately.
    - The vault is scanned for existing tags and wikilink targets.
-   - Ollama is asked for a structured JSON summary, with the existing tag vocabulary inserted into the prompt as a closed list.
+   - The summarizer is asked for a structured JSON summary, with the existing tag vocabulary inserted into the prompt as a closed list.
    - Hallucinated tags / wikilinks are filtered out post-hoc.
 4. A new file lands at `<vault>/2-calendar/YYYY/MM/meetings/YYYY-MM-DD-HHMM-<slug>.md`.
 5. A line is appended to today's daily under `## 🤖 Agent Log`.
-6. macOS notification: *Reunión guardada*.
+6. macOS notification: *Reunión guardada*, and the note shows up under **"Abrir última nota"**.
 
-Total post-processing time for a 30-minute meeting: ~30–60 seconds on an M3 Pro.
+Transcribing an hour-long call takes about 4–5 minutes on an M3 Pro.
+
+### Nothing gets lost
+
+Every recording is a small file in `queue/` from its first second until its note exists. If the app crashes, the Mac loses power, or you quit mid-meeting, the next launch finds it and finishes the job (the WAV header is refreshed every 5 s, so at most the last seconds are missing). A meeting that fails to process stays under **"⚠ Sin procesar"** with a retry, and a failed summary still produces a note with the full transcript.
 
 ## Output format
 
@@ -263,23 +300,34 @@ And the day's daily gets:
 
 ```
 src/
-├── main.rs              # tao event loop + tray + state machine
+├── main.rs              # event loop: menu, shortcut, control socket, recording watchdogs
+├── app/
+│   ├── menu.rs          # the tray menu and what each click means
+│   └── icon.rs          # menubar glyph cut out of the app icon
 ├── lib.rs               # module re-exports
-├── app_state.rs         # enum AppState { Idle, Recording, Processing }
+├── pipeline.rs          # recording → note; shared by the app, --selftest and test-e2e
+├── jobs.rs              # persistent queue, background worker, crash recovery, retention
+├── control.rs           # `stt-md toggle|start|stop|status` over a Unix socket
+├── history.rs           # notes written, for "Notas recientes"
+├── logging.rs           # timestamped log file when there is no terminal
+├── activity.rs          # keeps macOS from napping the app while it works
+├── app_state.rs         # enum AppState { Idle, Recording }
 ├── config.rs            # TOML config in Application Support
-├── paths.rs             # filesystem helpers
+├── paths.rs             # filesystem helpers (STT_MD_HOME moves everything)
+├── api_key.rs / usage.rs# Gemini key in the Keychain, monthly spend
 ├── sounds.rs            # afplay wrappers (Tink / Pop)
 ├── notifications.rs     # notify-rust for macOS notifications
 ├── meeting_detector.rs  # "¿Reunión en curso?" reminder (CoreAudio process objects)
-├── audio_utils.rs       # WAV load + mono + linear resample
+├── calendar_reminder.rs # "¿Grabo la reunión?" + current event (EventKit)
+├── audio_utils.rs       # WAV load, streaming windowed-sinc resampler, dead-air check
 ├── recording/
 │   ├── mic.rs           # cpal stream
 │   ├── system_audio.rs  # ScreenCaptureKit system-audio tap (macOS 13+)
-│   ├── mixer.rs         # mic + system downmix/mix thread
-│   └── wav_writer.rs    # hound writer on its own thread
+│   └── wav_writer.rs    # hound writer on its own thread, flushed every 5 s
 ├── transcription/
-│   └── whisper.rs       # whisper-rs wrapper with initial_prompt
+│   └── whisper.rs       # whisper-rs wrapper: windows, progress, hallucination filters
 ├── llm/
+│   ├── gemini.rs        # optional cloud summarizer
 │   ├── ollama.rs        # /api/generate with format=json
 │   ├── prompts.rs       # structured-summary prompt with vault vocabulary
 │   └── mod.rs           # MeetingSummary + enforce_vocab()
@@ -291,7 +339,8 @@ src/
 └── bin/
     ├── transcribe-wav.rs # CLI: WAV → bare-transcript .md (no LLM)
     ├── test-summary.rs   # CLI: prompt + Ollama dry run (set STT_MD_VAULT)
-    └── test-e2e.rs       # CLI: full pipeline against any vault
+    ├── resummarize.rs    # CLI: redo only the summary of an existing note
+    └── test-e2e.rs       # CLI: the app's pipeline on existing WAVs, any vault
 ```
 
 ## CLI helpers
@@ -303,8 +352,13 @@ src/
 # Dry-run the prompt + Ollama against your vault:
 STT_MD_VAULT="$HOME/path/to/vault" ./target/release/test-summary
 
-# Full pipeline against any vault directory:
-./target/release/test-e2e path/to/audio.wav path/to/vault
+# Full pipeline against any vault directory (also how to reprocess an old
+# recording: the note lands in the week and daily of the file's timestamp):
+./target/release/test-e2e path/to/mic.wav [path/to/sys.wav] path/to/vault
+
+# Run a second copy next to the installed app, with its own config, queue,
+# recordings and log (development, experiments):
+STT_MD_HOME=/tmp/stt-md-dev ./target/release/stt-md
 ```
 
 ## Design notes
@@ -335,8 +389,8 @@ This is a small piece of code (`MeetingSummary::enforce_vocab` in `src/llm/mod.r
 ## Known limitations
 
 - **System audio needs macOS 13+ and Screen Recording permission** (ScreenCaptureKit). Without either, the app records mic-only and says so in the tooltip.
-- **Batch at stop**, not streaming.
-- **Linear resampling** with no anti-aliasing low-pass. Fine for speech (80–4000 Hz).
+- **Batch at stop**, not streaming — but in the background, so it never blocks the next recording.
+- **The mic hears the speakers.** Without headphones the mic track carries a faint copy of the call; exact repeats are dropped as echo, but whisper still invents a line now and then over what is left.
 - **No code signing.** macOS will ask "Open Anyway" once per build. For wider distribution you'd need an Apple Developer ID ($99/year).
 - **Spanish-Obsidian opinionated.** Menu labels and the prompt template are in Spanish; the output schema assumes a `2-calendar/YYYY/MM/` daily-note vault. Both are easy to adapt — PRs welcome.
 

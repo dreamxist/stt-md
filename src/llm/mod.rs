@@ -130,7 +130,7 @@ impl MeetingSummary {
         self.tags = self
             .tags
             .iter()
-            .map(|t| sanitize_kebab(t))
+            .map(|t| normalize_person_name(t))
             .filter(|t| !t.is_empty())
             .collect();
         self.tags.sort();
@@ -230,28 +230,9 @@ impl MeetingSummary {
     }
 }
 
+/// Names and tags share the vault's file-name shape: ASCII kebab-case.
 fn normalize_person_name(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut prev_dash = true;
-    for ch in s.chars() {
-        let normalized = match ch {
-            'á' | 'à' | 'ä' | 'â' | 'Á' | 'À' | 'Ä' | 'Â' => 'a',
-            'é' | 'è' | 'ë' | 'ê' | 'É' | 'È' | 'Ë' | 'Ê' => 'e',
-            'í' | 'ì' | 'ï' | 'î' | 'Í' | 'Ì' | 'Ï' | 'Î' => 'i',
-            'ó' | 'ò' | 'ö' | 'ô' | 'Ó' | 'Ò' | 'Ö' | 'Ô' => 'o',
-            'ú' | 'ù' | 'ü' | 'û' | 'Ú' | 'Ù' | 'Ü' | 'Û' => 'u',
-            'ñ' | 'Ñ' => 'n',
-            c => c,
-        };
-        if normalized.is_ascii_alphanumeric() {
-            out.push(normalized.to_ascii_lowercase());
-            prev_dash = false;
-        } else if !prev_dash {
-            out.push('-');
-            prev_dash = true;
-        }
-    }
-    out.trim_matches('-').to_string()
+    crate::vault::meeting_writer::slugify(s)
 }
 
 fn is_valid_iso_date(s: &str) -> bool {
@@ -267,30 +248,6 @@ fn is_valid_iso_date(s: &str) -> bool {
             4 | 7 => *b == b'-',
             _ => b.is_ascii_digit(),
         })
-}
-
-fn sanitize_kebab(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut prev_dash = true;
-    for ch in s.chars() {
-        let n = match ch {
-            'á' | 'à' | 'ä' | 'â' | 'Á' | 'À' | 'Ä' | 'Â' => 'a',
-            'é' | 'è' | 'ë' | 'ê' | 'É' | 'È' | 'Ë' | 'Ê' => 'e',
-            'í' | 'ì' | 'ï' | 'î' | 'Í' | 'Ì' | 'Ï' | 'Î' => 'i',
-            'ó' | 'ò' | 'ö' | 'ô' | 'Ó' | 'Ò' | 'Ö' | 'Ô' => 'o',
-            'ú' | 'ù' | 'ü' | 'û' | 'Ú' | 'Ù' | 'Ü' | 'Û' => 'u',
-            'ñ' | 'Ñ' => 'n',
-            c => c,
-        };
-        if n.is_ascii_alphanumeric() {
-            out.push(n.to_ascii_lowercase());
-            prev_dash = false;
-        } else if !prev_dash {
-            out.push('-');
-            prev_dash = true;
-        }
-    }
-    out.trim_matches('-').to_string()
 }
 
 #[cfg(test)]
