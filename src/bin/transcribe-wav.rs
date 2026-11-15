@@ -15,11 +15,10 @@ fn main() -> Result<()> {
     let title = args.get(2).cloned().unwrap_or_else(|| "test".to_string());
 
     let t0 = Instant::now();
-    let (mono, sr) = audio_utils::load_wav_mono_f32(&wav_path)
+    let resampled = audio_utils::load_wav_16k_mono(&wav_path)
         .with_context(|| format!("failed to load {}", wav_path.display()))?;
-    let resampled = audio_utils::resample_to_16k(&mono, sr);
     println!(
-        "loaded {:.1}s of audio @ {sr}Hz → 16kHz in {}ms",
+        "loaded {:.1}s of audio → 16kHz in {}ms",
         resampled.len() as f32 / 16_000.0,
         t0.elapsed().as_millis()
     );

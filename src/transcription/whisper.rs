@@ -15,6 +15,10 @@ pub struct WhisperEngine {
 
 impl WhisperEngine {
     pub fn load(model_path: &Path) -> Result<Self> {
+        // whisper.cpp and ggml print some seventy lines of model and Metal
+        // details per load; with nothing listening on the hooks they go
+        // nowhere, and the log keeps to what the app itself has to say.
+        whisper_rs::install_logging_hooks();
         let model_str = model_path
             .to_str()
             .context("model path is not valid UTF-8")?;
@@ -40,11 +44,26 @@ impl WhisperEngine {
         language: &str,
         initial_prompt: Option<&str>,
     ) -> Result<Vec<TranscriptSegment>> {
+        self.transcribe_with_progress(samples_16k_mono, language, initial_prompt, &mut |_, _| {})
+    }
+
+    /// Like [`Self::transcribe`], calling `on_window(done, total)` after each
+    /// window is decoded so a long meeting can show how far along it is.
+    pub fn transcribe_with_progress(
+        &self,
+        samples_16k_mono: &[f32],
+        language: &str,
+        initial_prompt: Option<&str>,
+        on_window: &mut dyn FnMut(usize, usize),
+    ) -> Result<Vec<TranscriptSegment>> {
         let prompt = initial_prompt.unwrap_or(DEFAULT_INITIAL_PROMPT);
         let mut state = self.ctx.create_state()?;
         let mut segments = Vec::new();
+        let mut dropped = 0usize;
 
-        for (start, end) in speech_windows(samples_16k_mono) {
+        let windows = speech_windows(samples_16k_mono);
+        let total = windows.len();
+        for (done, (start, end)) in windows.into_iter().enumerate() {
             let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
             params.set_language(Some(language));
             params.set_translate(false);
@@ -69,7 +88,7 @@ impl WhisperEngine {
                 };
                 let text = strip_speaker_label(&text).to_string();
                 if is_known_hallucination(&text) || is_foreign_script(&text, language) {
-                    eprintln!("[stt-md] dropped hallucinated segment: {text}");
+                    dropped += 1;
                     continue;
                 }
                 segments.push(TranscriptSegment {
@@ -79,11 +98,21 @@ impl WhisperEngine {
                     speaker: None,
                 });
             }
+            on_window(done + 1, total);
         }
 
+        if dropped > 0 {
+            println!("[stt-md] dropped {dropped} hallucinated segments (credits, sound captions, foreign script)");
+        }
         drop_repetition_runs(&mut segments);
         Ok(segments)
     }
+}
+
+/// How many windows [`WhisperEngine::transcribe`] will decode for this audio:
+/// the unit its progress is counted in.
+pub fn speech_window_count(samples_16k_mono: &[f32]) -> usize {
+    speech_windows(samples_16k_mono).len()
 }
 
 const SAMPLE_RATE: usize = 16_000;
@@ -97,6 +126,9 @@ const SILENCE_FLOOR_RMS: f32 = 0.0056;
 /// Voiced frames a window needs to be worth decoding (1 s): a cough, a door
 /// or a chair isn't speech.
 const MIN_VOICED_FRAMES: usize = 50;
+/// Quiet kept on each side of a window's speech (0.5 s), so a soft first or
+/// last syllable below the threshold is not cut off.
+const EDGE_PAD_FRAMES: usize = 25;
 
 fn frame_rms(samples: &[f32]) -> Vec<f32> {
     samples
@@ -132,9 +164,19 @@ fn speech_windows(samples: &[f32]) -> Vec<(usize, usize)> {
                 .min_by(|&a, &b| rms[a].total_cmp(&rms[b]))
                 .map_or(hi, |i| i + 1)
         };
-        let voiced = rms[start..end].iter().filter(|&&r| r > threshold).count();
+        let is_voiced = |r: &f32| *r > threshold;
+        let voiced = rms[start..end].iter().filter(|r| is_voiced(r)).count();
         if voiced >= MIN_VOICED_FRAMES {
-            windows.push((start * FRAME, (end * FRAME).min(samples.len())));
+            // Hand whisper the speech, not the silence around it. A window
+            // that opens with ten quiet seconds comes back with its first
+            // segment stamped at the start of the window, which put the
+            // other side's answer at the same second as the question and
+            // shuffled who said what when the two tracks were merged.
+            let first = start + rms[start..end].iter().position(is_voiced).unwrap_or(0);
+            let last = start + rms[start..end].iter().rposition(is_voiced).unwrap_or(end - start - 1);
+            let from = first.saturating_sub(EDGE_PAD_FRAMES).max(start);
+            let to = (last + 1 + EDGE_PAD_FRAMES).min(end);
+            windows.push((from * FRAME, (to * FRAME).min(samples.len())));
         }
         start = end;
     }
@@ -171,13 +213,24 @@ fn is_known_hallucination(text: &str) -> bool {
 /// barco…", "*헤a*"), and no Spanish or English meeting has Cyrillic, Hangul,
 /// CJK or Arabic in it. Off when the language is "auto".
 fn is_foreign_script(text: &str, language: &str) -> bool {
+    // Bytes that were not UTF-8 at all: the decode fell apart mid-token
+    // and left a replacement character behind, whatever the language.
+    if text.contains('\u{FFFD}') {
+        return true;
+    }
     if !matches!(language, "es" | "en" | "pt") {
         return false;
     }
     text.chars().any(|c| {
         matches!(c as u32,
             0x0400..=0x04FF | 0x0600..=0x06FF | 0x1100..=0x11FF | 0x3040..=0x30FF
-            | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF)
+            | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF
+            // Vietnamese tone marks: "Una autos puedaảo".
+            | 0x1EA0..=0x1EF9)
+            // Latin letters these languages don't have. Over the faint echo
+            // of a call the mic track comes back as Icelandic or Turkish
+            // ("Já, við erum tvekta megið enklare", "Skasında").
+            || matches!(c, 'ð' | 'Ð' | 'þ' | 'Þ' | 'ı' | 'ğ' | 'ş' | 'ő' | 'ű' | 'ł')
     })
 }
 
@@ -229,18 +282,47 @@ fn strip_prompt_leak(text: &str, prompt: &str) -> Option<String> {
     if lower.len() >= 8 && prompt_lower.contains(lower.trim_end_matches(['.', ','])) {
         return None;
     }
+    // The prompt recited over and over inside one segment is a decode stuck
+    // in a loop: "The offer examinates. Vocabulario común: The offer
+    // examinates. Vocabulario común: …". Nothing in it was said.
+    let recited = prompt_lower
+        .split(['.', ':'])
+        .map(str::trim)
+        .filter(|p| p.len() >= 12)
+        .any(|phrase| lower.matches(phrase).count() >= 2);
+    if recited {
+        return None;
+    }
     let mut rest = text;
     for phrase in prompt.split(['.', ':']).map(str::trim).filter(|p| p.len() >= 8) {
-        if let Some(len) = leaked_prefix_len(rest, phrase) {
+        if let Some(len) = leaked_prefix_len(rest, phrase).or_else(|| leaked_label_len(rest, phrase)) {
             rest = rest[len..].trim_start_matches([':', '.', ',', ' ']);
         }
     }
     let leaked = rest.len() != text.len();
     let rest = rest.trim();
-    if rest.is_empty() || (leaked && is_leak_residue(rest)) {
+    if rest.is_empty() || (leaked && (is_leak_residue(rest) || is_quoted(rest))) {
         return None;
     }
     Some(rest.to_string())
+}
+
+/// A leak cut down to the phrase's first word used as a label: the prompt
+/// says "Vocabulario común: …" and the decode opens with "Vocabulario: …".
+/// Too short for [`leaked_prefix_len`], but nobody starts a sentence that way.
+fn leaked_label_len(text: &str, phrase: &str) -> Option<usize> {
+    let label = phrase.split_whitespace().next().filter(|w| w.chars().count() >= 8)?;
+    let head = text.get(..label.len())?;
+    (head.to_lowercase() == label.to_lowercase() && text[label.len()..].starts_with(':'))
+        .then_some(label.len())
+}
+
+/// Text that is one quotation from start to end. After a prompt leak that is
+/// how whisper writes speech it could not make out: three in one meeting,
+/// every one invented ("Solid, vién, dos, soli, kiela pecsí, siénti").
+fn is_quoted(text: &str) -> bool {
+    let inner = text.trim_end_matches(['.', ',', '…', ' ']);
+    inner.len() >= 2 && inner.starts_with('"') && inner.ends_with('"')
 }
 
 /// Drops the subtitle-style speaker label whisper.cpp invents from the audio
@@ -339,6 +421,35 @@ mod tests {
         ] {
             assert_eq!(strip_prompt_leak(junk, PROMPT), None, "{junk}");
         }
+    }
+
+    #[test]
+    fn drops_a_segment_that_recites_the_prompt_in_a_loop() {
+        let looped = "The offer examinates. Vocabulario común: The offer examinates. Vocabulario común: The offer examinates.";
+        assert_eq!(strip_prompt_leak(looped, PROMPT), None);
+        // Saying the phrase once, mid-sentence, is still speech.
+        let once = "Armemos un vocabulario común para el equipo";
+        assert_eq!(strip_prompt_leak(once, PROMPT).as_deref(), Some(once));
+    }
+
+    #[test]
+    fn drops_a_leak_followed_by_a_quotation_nobody_said() {
+        for junk in [
+            "Vocabulario común: \"Solid, vién, dos, soli, kiela pecsí, siénti\".",
+            "Vocabulario: \"Ya, vamos erum tvekta megid enklare.\"",
+        ] {
+            assert_eq!(strip_prompt_leak(junk, PROMPT), None, "{junk}");
+        }
+        // Real speech after the same leak survives, minus the label.
+        assert_eq!(
+            strip_prompt_leak("Vocabulario: y no pueden jugar, solo mostrarle el escenario", PROMPT).as_deref(),
+            Some("y no pueden jugar, solo mostrarle el escenario")
+        );
+        // A quotation with no leak in front is somebody quoting.
+        let quoting = "\"No me alcanza\", dijo el cliente.";
+        assert_eq!(strip_prompt_leak(quoting, PROMPT).as_deref(), Some(quoting));
+        let all_quote = "\"No me alcanza.\"";
+        assert_eq!(strip_prompt_leak(all_quote, PROMPT).as_deref(), Some(all_quote));
     }
 
     #[test]
@@ -444,6 +555,21 @@ mod tests {
     }
 
     #[test]
+    fn speech_windows_start_where_the_speech_does() {
+        // Ten quiet seconds, five of speech, ten quiet: the other side
+        // waiting for their turn, as the system track sees it.
+        let mut audio = vec![0.0; 10 * SAMPLE_RATE];
+        audio.extend(tone(5.0));
+        audio.extend(vec![0.0; 10 * SAMPLE_RATE]);
+        let windows = speech_windows(&audio);
+        assert_eq!(windows.len(), 1);
+        let (start, end) = windows[0];
+        let secs = |samples: usize| samples as f32 / SAMPLE_RATE as f32;
+        assert!((secs(start) - 9.5).abs() < 0.05, "starts at {}", secs(start));
+        assert!((secs(end) - 15.5).abs() < 0.05, "ends at {}", secs(end));
+    }
+
+    #[test]
     fn speech_windows_empty_for_silence() {
         assert!(speech_windows(&vec![0.0; 120 * SAMPLE_RATE]).is_empty());
         assert!(speech_windows(&[]).is_empty());
@@ -454,6 +580,13 @@ mod tests {
         assert!(is_foreign_script("y Islands la рубemma del barco", "es"));
         assert!(is_foreign_script("*헤a*", "es"));
         assert!(!is_foreign_script("Ñandú, pingüino, acción: ¿sí?", "es"));
+        assert!(!is_foreign_script("Søren y François van a São Paulo", "es"));
+        // The mic track over the echo of a call, as it really came back.
+        assert!(is_foreign_script("Já, við erum tvekta megið enklare.", "es"));
+        assert!(is_foreign_script("Una autos puedaảo.", "es"));
+        assert!(is_foreign_script("en segundo Skasında.", "es"));
+        // Broken bytes are garbage in any language.
+        assert!(is_foreign_script("Cla\u{FFFD}energy", "auto"));
         assert!(!is_foreign_script("рубемма", "auto"));
     }
 

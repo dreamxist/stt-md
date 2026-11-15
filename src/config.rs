@@ -80,10 +80,37 @@ pub struct Config {
     /// bundle-ID prefixes, e.g. ["us.zoom.xos", "com.google.chrome"].
     #[serde(default)]
     pub meeting_reminder_apps: Option<Vec<String>>,
+
+    /// System-wide shortcut that starts and stops a recording from any app,
+    /// e.g. "ctrl+alt+cmd+r" or "cmd+shift+F9". Empty disables it. Read at
+    /// launch. Three modifiers by default: a global shortcut takes its keys
+    /// away from every other app.
+    #[serde(default = "default_hotkey")]
+    pub hotkey: String,
+
+    /// Stop on its own after this many minutes with no voice on either track:
+    /// a forgotten Stop used to run for hours and delay the note until the
+    /// hard cap. The note's duration ends at the last voice. 0 disables it.
+    #[serde(default = "default_auto_stop_silence_min")]
+    pub auto_stop_silence_min: u64,
+
+    /// Delete recordings older than this many days; those still waiting to
+    /// become a note are never touched. `None` keeps them forever (an hour of
+    /// meeting is about 500 MB).
+    #[serde(default)]
+    pub keep_recordings_days: Option<u32>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_hotkey() -> String {
+    "ctrl+alt+cmd+r".to_string()
+}
+
+fn default_auto_stop_silence_min() -> u64 {
+    15
 }
 
 fn default_output_dir() -> PathBuf {
@@ -129,18 +156,68 @@ impl Default for Config {
             whisper_initial_prompt: None,
             meeting_reminder: true,
             meeting_reminder_apps: None,
+            hotkey: default_hotkey(),
+            auto_stop_silence_min: default_auto_stop_silence_min(),
+            keep_recordings_days: None,
         }
     }
 }
 
 impl Config {
-    /// Models to try for the summary, preferred first.
-    pub fn summary_models(&self) -> Vec<&str> {
-        self.summary_model
-            .as_deref()
+    /// Models to try for the summary, preferred first. A saved Gemini key
+    /// turns Gemini on even when the config doesn't name a model, so setting
+    /// the key from the menu is all it takes.
+    pub fn summary_models(&self) -> Vec<String> {
+        self.summary_models_given(crate::api_key::gemini_key().is_some())
+    }
+
+    fn summary_models_given(&self, has_gemini_key: bool) -> Vec<String> {
+        let cloud = self.summary_model.clone().or_else(|| {
+            has_gemini_key.then(|| crate::llm::gemini::DEFAULT_MODEL.to_string())
+        });
+        cloud
             .into_iter()
-            .chain(std::iter::once(self.ollama_model.as_str()))
+            .chain(std::iter::once(self.ollama_model.clone()))
             .collect()
+    }
+
+    /// Checks what a recording will need before one is made: the whisper
+    /// model on disk and somewhere to write the note.
+    pub fn validate(&self) -> Result<()> {
+        let model_path = self.whisper_model_path();
+        if !model_path.exists() {
+            anyhow::bail!(
+                "No se encontró el modelo Whisper en {}.\n\nDescárgalo con:\ncurl -L -o \"{}\" https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{}",
+                model_path.display(),
+                model_path.display(),
+                self.whisper_model_filename
+            );
+        }
+        match self.output_mode {
+            OutputMode::Obsidian => {
+                if !self.vault_root.is_dir() {
+                    anyhow::bail!(
+                        "vault_root no existe: {}.\n\nCorrige la ruta en {} (o usa output_mode = \"simple\").",
+                        self.vault_root.display(),
+                        Self::config_path().display()
+                    );
+                }
+            }
+            OutputMode::Simple => {
+                std::fs::create_dir_all(&self.output_dir).with_context(|| {
+                    format!("no se pudo crear output_dir {}", self.output_dir.display())
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Where notes land, for "show me the folder".
+    pub fn notes_root(&self) -> &Path {
+        match self.output_mode {
+            OutputMode::Obsidian => &self.vault_root,
+            OutputMode::Simple => &self.output_dir,
+        }
     }
 
     pub fn config_path() -> PathBuf {
@@ -183,9 +260,37 @@ mod tests {
     #[test]
     fn summary_models_put_the_cloud_model_before_the_local_one() {
         let mut cfg = Config::default();
-        assert_eq!(cfg.summary_models(), vec!["qwen2.5:7b"]);
+        assert_eq!(cfg.summary_models_given(false), vec!["qwen2.5:7b"]);
         cfg.summary_model = Some("gemini-3.8-flash".into());
-        assert_eq!(cfg.summary_models(), vec!["gemini-3.8-flash", "qwen2.5:7b"]);
+        assert_eq!(
+            cfg.summary_models_given(false),
+            vec!["gemini-3.8-flash", "qwen2.5:7b"]
+        );
+    }
+
+    #[test]
+    fn a_saved_gemini_key_is_enough_to_summarize_with_gemini() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.summary_models_given(true),
+            vec![crate::llm::gemini::DEFAULT_MODEL, "qwen2.5:7b"]
+        );
+    }
+
+    #[test]
+    fn a_config_written_before_the_new_settings_gets_their_defaults() {
+        let cfg: Config = toml::from_str(
+            r#"
+ollama_model = "qwen2.5:7b"
+ollama_url = "http://localhost:11434"
+whisper_language = "es"
+whisper_model_filename = "ggml-large-v3-turbo.bin"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.hotkey, "ctrl+alt+cmd+r");
+        assert_eq!(cfg.auto_stop_silence_min, 15);
+        assert_eq!(cfg.keep_recordings_days, None);
     }
 
     #[test]

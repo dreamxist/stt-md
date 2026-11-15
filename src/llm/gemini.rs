@@ -31,9 +31,22 @@ struct GenerationConfig {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Response {
     #[serde(default)]
     candidates: Vec<Candidate>,
+    usage_metadata: Option<UsageMetadata>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct UsageMetadata {
+    #[serde(default)]
+    prompt_token_count: u64,
+    #[serde(default)]
+    candidates_token_count: u64,
+    #[serde(default)]
+    thoughts_token_count: u64,
 }
 
 #[derive(Deserialize)]
@@ -81,6 +94,13 @@ pub fn generate_json(prompt: &str, model: &str) -> Result<String> {
         anyhow::bail!("gemini returned {status}: {txt}");
     }
     let parsed: Response = resp.json()?;
+    if let Some(u) = &parsed.usage_metadata {
+        crate::usage::record(
+            model,
+            u.prompt_token_count,
+            u.candidates_token_count + u.thoughts_token_count,
+        );
+    }
     let text: String = parsed
         .candidates
         .into_iter()

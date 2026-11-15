@@ -35,9 +35,41 @@ pub const SYSTEM_AUDIO_STALL: Duration = Duration::from_secs(90);
 /// rarer than one that has quietly broken: a real recording went 4,5 minutes.
 pub const SYSTEM_AUDIO_MISSING: Duration = Duration::from_secs(8 * 60);
 
-/// Each restart costs a fraction of a second of audio, so a tap that keeps
-/// dying is a problem to report, not to keep papering over.
-const MAX_SYSTEM_RESTARTS: u32 = 5;
+/// When to restart a tap that delivers nothing but zeros while audio plays.
+///
+/// Zeros with something playing is what a dead tap looks like, but it is also
+/// what a call looks like while the user presents for two minutes and nobody
+/// else speaks: the browser keeps its output open and sends exact silence. A
+/// fixed budget of five restarts was spent on one such meeting, each with its
+/// own alarming notification, leaving nothing for a tap that really died
+/// later. So a restart that is followed by audio proves nothing was wrong and
+/// costs nothing, and one that isn't doubles the wait before the next try:
+/// 90 s, 3 min, 6 min, up to 24 min — a handful per hour at worst, never zero.
+#[derive(Debug, Default)]
+struct RestartBackoff {
+    /// Restarts in a row that were not followed by any audio.
+    fruitless: u32,
+    restarted_at: Option<Instant>,
+}
+
+impl RestartBackoff {
+    fn wait(&self) -> Duration {
+        SYSTEM_AUDIO_STALL * 2u32.pow(self.fruitless.min(4))
+    }
+
+    /// Whether a restart is due, given when the tap last delivered audio.
+    fn due(&mut self, last_audio: Instant, now: Instant) -> bool {
+        if self.restarted_at.is_some_and(|r| last_audio > r) {
+            *self = Self::default();
+        }
+        now.saturating_duration_since(last_audio) >= self.wait()
+    }
+
+    fn restarted(&mut self, now: Instant) {
+        self.fruitless += 1;
+        self.restarted_at = Some(now);
+    }
+}
 use wav_writer::{LastVoice, WavSink};
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -69,6 +101,7 @@ struct SystemTap {
     tx: Sender<Vec<f32>>,
     last_audio: LastAudio,
     restarts: u32,
+    backoff: RestartBackoff,
 }
 
 pub struct RecordingSession {
@@ -137,6 +170,7 @@ impl RecordingSession {
             tx: sys_tx,
             last_audio: sys_last_audio,
             restarts: 0,
+            backoff: RestartBackoff::default(),
         };
 
         let base = timestamp_base();
@@ -170,24 +204,33 @@ impl RecordingSession {
         })
     }
 
+    /// The WAV(s) this session is writing, known from the first sample so the
+    /// recording can be put on record before it ends.
+    pub fn paths(&self) -> (PathBuf, Option<PathBuf>) {
+        (
+            self.mic_wav.path.clone(),
+            self.sys_wav.as_ref().map(|w| w.path.clone()),
+        )
+    }
+
     /// How long neither the mic nor the system audio has carried voice.
     pub fn silent_for(&self) -> Duration {
         self.last_voice.lock().elapsed()
     }
 
-    /// Whether the tap is broken: exact zeros while an app is actually playing.
+    /// Whether the tap looks broken: exact zeros while an app is actually playing.
     ///
     /// The mic is no help in deciding this. Both a dead tap and an ordinary
     /// quiet stretch deliver exact zeros — a real 37-minute recording held 268
     /// seconds of them with the tap perfectly alive — so keying off "the mic
-    /// hears someone" restarts a healthy stream and burns the retry budget.
-    /// Asking the HAL who is playing is the signal that actually separates them.
-    pub fn system_audio_stalled(&self) -> bool {
-        let Some(tap) = self.system.as_ref() else {
+    /// hears someone" restarts a healthy stream. Asking the HAL who is playing
+    /// separates most cases, and [`RestartBackoff`] absorbs the rest.
+    pub fn system_audio_stalled(&mut self) -> bool {
+        let Some(tap) = self.system.as_mut() else {
             return false;
         };
-        tap.restarts < MAX_SYSTEM_RESTARTS
-            && tap.last_audio.lock().elapsed() >= SYSTEM_AUDIO_STALL
+        let last_audio = *tap.last_audio.lock();
+        tap.backoff.due(last_audio, Instant::now())
             && crate::meeting_detector::output_is_playing()
     }
 
@@ -203,21 +246,27 @@ impl RecordingSession {
             && self.silent_for() < Duration::from_secs(60)
     }
 
-    /// Tears the dead SCStream down and opens a new one onto the same channel,
-    /// so the WAV writer keeps appending to the file it already has. The gap is
-    /// whatever SCK takes to hand over, well under a second.
+    /// Tears the SCStream down and opens a new one onto the same channel, so
+    /// the WAV writer keeps appending to the file it already has. The time the
+    /// handover takes is written as silence, which keeps everything after it
+    /// lined up with the mic track.
     pub fn restart_system_audio(&mut self) -> Result<u32> {
         let Some(tap) = self.system.as_mut() else {
             return Err(anyhow!("esta sesión no está capturando audio del sistema"));
         };
+        let started = Instant::now();
         tap.restarts += 1;
+        tap.backoff.restarted(started);
         // Drop first: two taps on the same display fight over the audio unit.
         tap.capture = None;
-        *tap.last_audio.lock() = Instant::now();
+        *tap.last_audio.lock() = started;
         tap.capture = Some(SystemAudioCapture::start(
             tap.tx.clone(),
             tap.last_audio.clone(),
         )?);
+        let gap = (started.elapsed().as_secs_f64() * SYSTEM_AUDIO_SAMPLE_RATE as f64) as usize
+            * SYSTEM_AUDIO_CHANNELS as usize;
+        let _ = tap.tx.send(vec![0.0; gap]);
         Ok(tap.restarts)
     }
 
@@ -260,5 +309,47 @@ fn join_or_log(name: &str, handle: JoinHandle<Result<()>>) {
         Ok(Ok(())) => {}
         Ok(Err(e)) => eprintln!("[stt-md] {name} error: {e:?}"),
         Err(_) => eprintln!("[stt-md] {name} thread panicked"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restarts_back_off_until_audio_proves_the_tap_alive() {
+        let t0 = Instant::now();
+        let secs = |s: u64| t0 + Duration::from_secs(s);
+        let mut b = RestartBackoff::default();
+
+        // Silent since t0: nothing before 90 s, a restart at 90 s.
+        assert!(!b.due(t0, secs(60)));
+        assert!(b.due(t0, secs(90)));
+        b.restarted(secs(90));
+
+        // Still silent after the restart (which resets the clock to 90 s):
+        // the second try waits 3 minutes, the third 6.
+        assert!(!b.due(secs(90), secs(90 + 100)));
+        assert!(b.due(secs(90), secs(90 + 180)));
+        b.restarted(secs(270));
+        assert!(!b.due(secs(270), secs(270 + 300)));
+        assert!(b.due(secs(270), secs(270 + 360)));
+        b.restarted(secs(630));
+
+        // Audio arrives: whatever happened, the tap works. Back to 90 s.
+        let heard = secs(700);
+        assert!(!b.due(heard, secs(760)));
+        assert_eq!(b.fruitless, 0);
+        assert!(b.due(heard, secs(790)));
+    }
+
+    #[test]
+    fn the_wait_stops_growing_but_restarts_never_stop() {
+        let mut b = RestartBackoff::default();
+        let t0 = Instant::now();
+        for _ in 0..50 {
+            b.restarted(t0);
+        }
+        assert_eq!(b.wait(), SYSTEM_AUDIO_STALL * 16);
     }
 }

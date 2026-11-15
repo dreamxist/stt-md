@@ -37,13 +37,26 @@ const VIDEO_LINK_HINTS: &[&str] = &[
     "around.co",
 ];
 
-pub fn spawn(state: Arc<Mutex<AppState>>) {
+/// How far back an event may have started and still be "the meeting that is
+/// on": long workshops exist, all-day blocks are excluded elsewhere.
+const CURRENT_LOOKBACK_SECS: f64 = 6.0 * 3600.0;
+/// A recording started a couple of minutes early still belongs to the event.
+const CURRENT_LEAD_SECS: f64 = 2.0 * 60.0;
+
+/// Title of the calendar meeting happening right now, kept fresh by the
+/// calendar thread. A recording that starts takes it along as context for the
+/// summary and as `event:` in the note.
+pub type CurrentEvent = Arc<Mutex<Option<String>>>;
+
+/// Starts the calendar thread: it nudges when a meeting starts and nothing is
+/// recording, and keeps `current` pointing at the meeting that is on.
+pub fn spawn(state: Arc<Mutex<AppState>>, current: CurrentEvent) {
     let _ = thread::Builder::new()
         .name("calendar-reminder".into())
-        .spawn(move || run_loop(state));
+        .spawn(move || run_loop(state, current));
 }
 
-fn run_loop(state: Arc<Mutex<AppState>>) {
+fn run_loop(state: Arc<Mutex<AppState>>, current: CurrentEvent) {
     let store = unsafe { EKEventStore::new() };
     request_access_if_needed(&store);
 
@@ -54,7 +67,9 @@ fn run_loop(state: Arc<Mutex<AppState>>) {
     loop {
         let status = unsafe { EKEventStore::authorizationStatusForEntityType(EKEntityType::Event) };
         if status == EKAuthorizationStatus::FullAccess {
-            autoreleasepool(|_| check_events(&store, &state, &mut handled));
+            let candidates = autoreleasepool(|_| read_events(&store));
+            *current.lock() = pick_current(&candidates).map(|c| c.title.trim().to_string());
+            remind_of_starting(&candidates, &state, &mut handled);
         }
         thread::sleep(POLL_INTERVAL);
     }
@@ -71,33 +86,48 @@ fn request_access_if_needed(store: &EKEventStore) {
     unsafe { store.requestFullAccessToEventsWithCompletion(RcBlock::as_ptr(&block)) };
 }
 
-fn check_events(store: &EKEventStore, state: &Mutex<AppState>, handled: &mut HashSet<String>) {
-    let start = NSDate::dateWithTimeIntervalSinceNow(-GRACE_SECS);
-    let end = NSDate::dateWithTimeIntervalSinceNow(LEAD_SECS);
+/// Every event overlapping the window that matters: from those that began
+/// hours ago and may still be on, to those about to start.
+fn read_events(store: &EKEventStore) -> Vec<Candidate> {
+    let start = NSDate::dateWithTimeIntervalSinceNow(-CURRENT_LOOKBACK_SECS);
+    let end = NSDate::dateWithTimeIntervalSinceNow(CURRENT_LEAD_SECS.max(LEAD_SECS));
     let predicate =
         unsafe { store.predicateForEventsWithStartDate_endDate_calendars(&start, &end, None) };
     let events = unsafe { store.eventsMatchingPredicate(&predicate) };
+    events.iter().map(|event| read_event(&event)).collect()
+}
 
-    for event in events.iter() {
-        let candidate = read_event(&event);
+/// The meeting that is on right now: started (or about to) and not over. With
+/// back-to-back or overlapping events, the one that started last.
+fn pick_current(candidates: &[Candidate]) -> Option<&Candidate> {
+    candidates
+        .iter()
+        .filter(|c| {
+            c.looks_like_meeting()
+                && !c.title.trim().is_empty()
+                && c.starts_in_secs <= CURRENT_LEAD_SECS
+                && c.ends_in_secs > 0.0
+        })
+        .min_by(|a, b| a.starts_in_secs.abs().total_cmp(&b.starts_in_secs.abs()))
+}
+
+fn remind_of_starting(
+    candidates: &[Candidate],
+    state: &Mutex<AppState>,
+    handled: &mut HashSet<String>,
+) {
+    for candidate in candidates {
         if !(-GRACE_SECS..=LEAD_SECS).contains(&candidate.starts_in_secs)
             || !candidate.looks_like_meeting()
             || handled.contains(&candidate.key)
         {
             continue;
         }
-        match *state.lock() {
-            AppState::Recording { .. } => {
-                handled.insert(candidate.key);
-            }
-            // Esperar a que termine el post-proceso de la reunión anterior.
-            AppState::Processing => {}
-            AppState::Idle => {
-                println!("[stt-md] calendar meeting starting: {}", candidate.title);
-                notifications::calendar_meeting_starting(&candidate.title);
-                handled.insert(candidate.key);
-            }
+        if !state.lock().is_recording() {
+            println!("[stt-md] calendar meeting starting: {}", candidate.title);
+            notifications::calendar_meeting_starting(&candidate.title);
         }
+        handled.insert(candidate.key.clone());
     }
 }
 
@@ -105,6 +135,7 @@ struct Candidate {
     key: String,
     title: String,
     starts_in_secs: f64,
+    ends_in_secs: f64,
     all_day: bool,
     other_attendees: usize,
     text: String,
@@ -126,6 +157,7 @@ fn read_event(event: &EKEvent) -> Candidate {
     unsafe {
         let start = event.startDate();
         let starts_in_secs = start.timeIntervalSinceNow();
+        let ends_in_secs = event.endDate().timeIntervalSinceNow();
         let title = event.title().to_string();
         let id = event.eventIdentifier().map(|s| s.to_string()).unwrap_or_else(|| title.clone());
         let other_attendees = event
@@ -148,6 +180,7 @@ fn read_event(event: &EKEvent) -> Candidate {
             key: format!("{id}@{}", start.timeIntervalSince1970() as i64),
             title,
             starts_in_secs,
+            ends_in_secs,
             all_day: event.isAllDay(),
             other_attendees,
             text,
@@ -164,6 +197,7 @@ mod tests {
             key: "k".into(),
             title: "t".into(),
             starts_in_secs: 0.0,
+            ends_in_secs: 1800.0,
             all_day,
             other_attendees,
             text: text.into(),
@@ -176,6 +210,35 @@ mod tests {
         assert!(candidate(0, "https://meet.google.com/abc-defg-hij", false).looks_like_meeting());
         assert!(candidate(0, "Unirse: https://US02WEB.ZOOM.US/j/123", false).looks_like_meeting());
         assert!(!candidate(0, "Foco: escribir propuesta", false).looks_like_meeting());
+    }
+
+    fn at(title: &str, starts_in_min: f64, ends_in_min: f64) -> Candidate {
+        Candidate {
+            title: title.into(),
+            starts_in_secs: starts_in_min * 60.0,
+            ends_in_secs: ends_in_min * 60.0,
+            ..candidate(1, "", false)
+        }
+    }
+
+    #[test]
+    fn current_event_is_the_meeting_that_is_on_now() {
+        let events = [
+            at("Ya terminó", -90.0, -30.0),
+            at("Workshop largo", -120.0, 60.0),
+            at("Coordinación semanal", -3.0, 27.0),
+            at("La siguiente", 30.0, 60.0),
+            Candidate { all_day: true, ..at("Feriado", -600.0, 600.0) },
+            Candidate { other_attendees: 0, ..at("Foco", -1.0, 59.0) },
+        ];
+        assert_eq!(pick_current(&events).map(|c| c.title.as_str()), Some("Coordinación semanal"));
+
+        // Grabar un minuto antes de la hora igual toma el evento que viene.
+        let early = [at("Standup", 1.0, 16.0)];
+        assert_eq!(pick_current(&early).map(|c| c.title.as_str()), Some("Standup"));
+
+        assert!(pick_current(&[at("Más tarde", 30.0, 60.0)]).is_none());
+        assert!(pick_current(&[at("  ", -1.0, 30.0)]).is_none());
     }
 
     #[test]
