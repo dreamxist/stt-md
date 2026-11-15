@@ -2,38 +2,80 @@ use anyhow::Result;
 use hound::WavReader;
 use std::path::Path;
 
+/// Whisper's input rate.
+pub const TARGET_RATE: u32 = 16_000;
+
 /// Loads a WAV file as mono f32 samples in [-1.0, 1.0], returning the file's sample rate.
 pub fn load_wav_mono_f32(path: &Path) -> Result<(Vec<f32>, u32)> {
     let mut reader = WavReader::open(path)?;
-    let spec = reader.spec();
-    let channels = spec.channels as usize;
-    let sample_rate = spec.sample_rate;
-
-    let samples: Vec<f32> = match (spec.sample_format, spec.bits_per_sample) {
-        (hound::SampleFormat::Int, 16) => reader
-            .samples::<i16>()
-            .map(|s| s.map(|s| (s as f32) / (i16::MAX as f32)))
-            .collect::<Result<Vec<_>, _>>()?,
-        (hound::SampleFormat::Int, 32) => reader
-            .samples::<i32>()
-            .map(|s| s.map(|s| (s as f32) / (i32::MAX as f32)))
-            .collect::<Result<Vec<_>, _>>()?,
-        (hound::SampleFormat::Float, 32) => reader
-            .samples::<f32>()
-            .collect::<Result<Vec<_>, _>>()?,
-        (fmt, bits) => anyhow::bail!("unsupported wav format: {fmt:?} {bits}-bit"),
-    };
-
-    let mono = if channels == 1 {
-        samples
-    } else {
-        samples
-            .chunks_exact(channels)
-            .map(|frame| frame.iter().sum::<f32>() / (channels as f32))
-            .collect()
-    };
-
+    let sample_rate = reader.spec().sample_rate;
+    let mut mono = Vec::new();
+    for_each_mono_chunk(&mut reader, |chunk| mono.extend_from_slice(chunk))?;
     Ok((mono, sample_rate))
+}
+
+/// Loads a WAV straight to 16 kHz mono, resampling as it reads.
+///
+/// A two-hour 48 kHz track is 1.4 GB as f32 before it is resampled; decoding
+/// it in chunks keeps only the 16 kHz result in memory.
+pub fn load_wav_16k_mono(path: &Path) -> Result<Vec<f32>> {
+    let mut reader = WavReader::open(path)?;
+    let spec = reader.spec();
+    let frames = reader.duration() as usize;
+    let mut resampler = Resampler::new(spec.sample_rate);
+    let mut out = Vec::with_capacity(
+        (frames as u64 * TARGET_RATE as u64 / spec.sample_rate.max(1) as u64) as usize + 16,
+    );
+    for_each_mono_chunk(&mut reader, |chunk| resampler.push(chunk, &mut out))?;
+    resampler.finish(&mut out);
+    Ok(out)
+}
+
+const CHUNK_FRAMES: usize = 1 << 16;
+
+/// Decodes the WAV in chunks, downmixed to mono f32, without ever holding the
+/// whole file.
+fn for_each_mono_chunk<R: std::io::Read>(
+    reader: &mut WavReader<R>,
+    mut sink: impl FnMut(&[f32]),
+) -> Result<()> {
+    let spec = reader.spec();
+    let channels = spec.channels.max(1) as usize;
+    let mut frame = Vec::with_capacity(channels);
+    let mut chunk = Vec::with_capacity(CHUNK_FRAMES);
+    let mut push = |sample: f32, chunk: &mut Vec<f32>, sink: &mut dyn FnMut(&[f32])| {
+        frame.push(sample);
+        if frame.len() == channels {
+            chunk.push(frame.iter().sum::<f32>() / channels as f32);
+            frame.clear();
+            if chunk.len() == CHUNK_FRAMES {
+                sink(chunk);
+                chunk.clear();
+            }
+        }
+    };
+    match (spec.sample_format, spec.bits_per_sample) {
+        (hound::SampleFormat::Int, 16) => {
+            for s in reader.samples::<i16>() {
+                push(s? as f32 / i16::MAX as f32, &mut chunk, &mut sink);
+            }
+        }
+        (hound::SampleFormat::Int, 32) => {
+            for s in reader.samples::<i32>() {
+                push(s? as f32 / i32::MAX as f32, &mut chunk, &mut sink);
+            }
+        }
+        (hound::SampleFormat::Float, 32) => {
+            for s in reader.samples::<f32>() {
+                push(s?, &mut chunk, &mut sink);
+            }
+        }
+        (fmt, bits) => anyhow::bail!("unsupported wav format: {fmt:?} {bits}-bit"),
+    }
+    if !chunk.is_empty() {
+        sink(&chunk);
+    }
+    Ok(())
 }
 
 /// The longest stretch of exact digital silence in a track: where it starts
@@ -74,26 +116,203 @@ pub fn dead_air(samples: &[f32], sample_rate: u32) -> Option<(f32, f32)> {
     (best_len >= min_run).then(|| (best_start as f32 / rate, best_len as f32 / rate))
 }
 
-/// Linear interpolation resample to 16kHz. Adequate for the speech band that
-/// Whisper consumes; a windowed-sinc resampler would only matter for music.
+/// Resamples to 16 kHz in one go. See [`Resampler`].
 pub fn resample_to_16k(samples: &[f32], from_rate: u32) -> Vec<f32> {
-    if from_rate == 16_000 {
+    if from_rate == TARGET_RATE {
         return samples.to_vec();
     }
-    let ratio = 16_000.0 / from_rate as f32;
-    let out_len = (samples.len() as f32 * ratio).ceil() as usize;
-    let mut out = Vec::with_capacity(out_len);
-    for i in 0..out_len {
-        let src_pos = i as f32 / ratio;
-        let idx = src_pos as usize;
-        let frac = src_pos - idx as f32;
-        if idx + 1 < samples.len() {
-            out.push(samples[idx] * (1.0 - frac) + samples[idx + 1] * frac);
-        } else if idx < samples.len() {
-            out.push(samples[idx]);
+    let mut resampler = Resampler::new(from_rate);
+    let mut out = Vec::with_capacity(
+        (samples.len() as u64 * TARGET_RATE as u64 / from_rate.max(1) as u64) as usize + 16,
+    );
+    resampler.push(samples, &mut out);
+    resampler.finish(&mut out);
+    out
+}
+
+/// Zero crossings of the sinc kept on each side of the filter's centre.
+const SINC_ZEROS: f64 = 12.0;
+/// Where the low-pass starts rolling off, as a share of the narrower Nyquist.
+const CUTOFF_MARGIN: f64 = 0.92;
+/// Above this many filter phases the table stops being worth it. Every rate a
+/// sound card actually offers reduces to far fewer (44.1 kHz → 160).
+const MAX_PHASES: usize = 4_096;
+
+/// Streaming resampler to 16 kHz: a windowed-sinc low-pass evaluated at the
+/// exact position of each output sample.
+///
+/// Positions are integers (`i * from / 16000` as quotient and remainder), not
+/// floats, on purpose. The first version computed them in `f32`, which runs
+/// out of mantissa after 2^24 samples: six minutes into a 48 kHz recording the
+/// read position started snapping to every 2nd source sample, then every 4th,
+/// 8th and 16th. A clean tone measured 153 dB of signal-to-noise in the first
+/// minutes, 21 dB at minute 6, 7 dB at minute 24 and −0.5 dB — more noise than
+/// signal — from minute 47 on, so the second half of every long meeting
+/// reached Whisper as mush. The low-pass is what keeps everything above
+/// 8 kHz from folding back into the speech band, which plain decimation did.
+pub struct Resampler {
+    /// `from / 16000` reduced: output `i` sits at source position `i * step / phases`.
+    step: usize,
+    phases: usize,
+    /// `phases` rows of `2 * half + 1` taps; row `r` is the filter centred
+    /// `r / phases` of a sample past an integer position.
+    taps: Vec<f32>,
+    half: usize,
+    /// Source samples not yet fully consumed; `buf[0]` is sample `buf_start`.
+    buf: Vec<f32>,
+    buf_start: usize,
+    /// Source samples seen so far.
+    seen: usize,
+    /// Next output index to produce.
+    next_out: usize,
+    passthrough: bool,
+}
+
+impl Resampler {
+    pub fn new(from_rate: u32) -> Self {
+        let from = from_rate.max(1) as usize;
+        let to = TARGET_RATE as usize;
+        let g = gcd(from, to);
+        let (step, phases) = (from / g, to / g);
+        let passthrough = from == to;
+
+        // Cutoff in cycles per source sample: the narrower of the two Nyquists.
+        let cutoff = 0.5 * (to as f64 / from as f64).min(1.0) * CUTOFF_MARGIN;
+        let half = (SINC_ZEROS / (2.0 * cutoff)).ceil() as usize;
+        let width = 2 * half + 1;
+        let table_phases = if phases <= MAX_PHASES { phases } else { 0 };
+        let mut taps = vec![0f32; table_phases * width];
+        for r in 0..table_phases {
+            let row = &mut taps[r * width..(r + 1) * width];
+            let frac = r as f64 / phases as f64;
+            let mut sum = 0f64;
+            let mut values = vec![0f64; width];
+            for (k, v) in values.iter_mut().enumerate() {
+                // Distance from this tap's source sample to the output position.
+                let x = k as f64 - half as f64 - frac;
+                *v = sinc(2.0 * cutoff * x) * hann(x / (half as f64 + 1.0));
+                sum += *v;
+            }
+            for (t, v) in row.iter_mut().zip(values) {
+                *t = (v / sum) as f32;
+            }
+        }
+        Self {
+            step,
+            phases,
+            taps,
+            half,
+            buf: Vec::new(),
+            buf_start: 0,
+            seen: 0,
+            next_out: 0,
+            passthrough,
         }
     }
-    out
+
+    /// Feeds source samples; appends whatever output they complete.
+    pub fn push(&mut self, samples: &[f32], out: &mut Vec<f32>) {
+        if self.passthrough {
+            out.extend_from_slice(samples);
+            return;
+        }
+        self.buf.extend_from_slice(samples);
+        self.seen += samples.len();
+        self.drain(out, false);
+    }
+
+    /// Emits the tail that was waiting for samples that will never come.
+    pub fn finish(&mut self, out: &mut Vec<f32>) {
+        if !self.passthrough {
+            self.drain(out, true);
+        }
+    }
+
+    fn drain(&mut self, out: &mut Vec<f32>, last: bool) {
+        let width = 2 * self.half + 1;
+        loop {
+            let pos = self.next_out * self.step;
+            let (centre, phase) = (pos / self.phases, pos % self.phases);
+            if centre >= self.seen {
+                break;
+            }
+            // Mid-stream, wait until the whole filter fits; at the end the
+            // missing tail counts as silence.
+            if !last && centre + self.half >= self.seen {
+                break;
+            }
+            let sample = if self.taps.is_empty() {
+                self.linear(centre, phase)
+            } else {
+                let row = &self.taps[phase * width..(phase + 1) * width];
+                self.convolve(centre, row)
+            };
+            out.push(sample);
+            self.next_out += 1;
+        }
+        // Keep only what the next output can still reach back to.
+        let next_centre = self.next_out * self.step / self.phases;
+        let keep_from = next_centre.saturating_sub(self.half).max(self.buf_start);
+        if keep_from > self.buf_start {
+            self.buf.drain(..(keep_from - self.buf_start).min(self.buf.len()));
+            self.buf_start = keep_from;
+        }
+    }
+
+    fn convolve(&self, centre: usize, row: &[f32]) -> f32 {
+        let first = centre as isize - self.half as isize;
+        let lo = first - self.buf_start as isize;
+        if lo >= 0 && lo as usize + row.len() <= self.buf.len() {
+            let window = &self.buf[lo as usize..lo as usize + row.len()];
+            return window.iter().zip(row).map(|(s, t)| s * t).sum();
+        }
+        // Start or end of the recording: use the taps that land on real audio
+        // and renormalise, so the edges don't fade towards silence.
+        let (mut acc, mut weight) = (0f32, 0f32);
+        for (k, t) in row.iter().enumerate() {
+            let idx = lo + k as isize;
+            if idx >= 0 && (idx as usize) < self.buf.len() {
+                acc += self.buf[idx as usize] * t;
+                weight += t;
+            }
+        }
+        if weight.abs() > 1e-6 { acc / weight } else { 0.0 }
+    }
+
+    /// Fallback for rates whose ratio needs an absurd number of phases.
+    fn linear(&self, centre: usize, phase: usize) -> f32 {
+        let at = |i: usize| {
+            i.checked_sub(self.buf_start)
+                .and_then(|j| self.buf.get(j))
+                .copied()
+        };
+        let a = at(centre).unwrap_or(0.0);
+        let b = at(centre + 1).unwrap_or(a);
+        let frac = phase as f32 / self.phases as f32;
+        a * (1.0 - frac) + b * frac
+    }
+}
+
+fn gcd(a: usize, b: usize) -> usize {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+fn sinc(x: f64) -> f64 {
+    if x.abs() < 1e-12 {
+        1.0
+    } else {
+        let px = std::f64::consts::PI * x;
+        px.sin() / px
+    }
+}
+
+/// Hann window over `x` in [-1, 1].
+fn hann(x: f64) -> f64 {
+    if x.abs() >= 1.0 {
+        0.0
+    } else {
+        0.5 * (1.0 + (std::f64::consts::PI * x).cos())
+    }
 }
 
 #[cfg(test)]
@@ -140,6 +359,107 @@ mod tests {
         assert!((at - 600.0).abs() < 1.0);
     }
 
+    fn sine(hz: f64, rate: u32, start: usize, len: usize) -> Vec<f32> {
+        (start..start + len)
+            .map(|i| (2.0 * std::f64::consts::PI * hz * i as f64 / rate as f64).sin() as f32 * 0.5)
+            .collect()
+    }
+
+    /// Signal-to-noise of `out` against the ideal 16 kHz sine, in dB.
+    fn snr_db(out: &[f32], hz: f64, first_out_index: usize) -> f64 {
+        let (mut sig, mut err) = (0f64, 0f64);
+        for (k, o) in out.iter().enumerate() {
+            let i = first_out_index + k;
+            let ideal = (2.0 * std::f64::consts::PI * hz * i as f64 / 16_000.0).sin() * 0.5;
+            sig += ideal * ideal;
+            err += (*o as f64 - ideal).powi(2);
+        }
+        10.0 * (sig / err.max(1e-30)).log10()
+    }
+
+    /// The bug that turned the second half of long meetings into noise: read
+    /// positions computed in f32 drift off once the sample count passes 2^24.
+    /// Feeds the resampler as if an hour had already gone by and checks the
+    /// tone still comes out clean.
+    #[test]
+    fn resample_stays_exact_an_hour_into_a_recording() {
+        for rate in [48_000u32, 24_000, 44_100] {
+            let mut r = Resampler::new(rate);
+            // Pretend 61 minutes were already consumed: positions are what
+            // matter, and they depend only on the output index.
+            let skipped_out = 61 * 60 * 16_000usize;
+            let skipped_src = skipped_out * r.step / r.phases;
+            r.next_out = skipped_out;
+            r.buf_start = skipped_src;
+            r.seen = skipped_src;
+            let mut out = Vec::new();
+            r.push(&sine(1_000.0, rate, skipped_src, rate as usize * 2), &mut out);
+            // Skip the first taps, which see the artificial edge.
+            let body = &out[200..out.len() - 200];
+            let snr = snr_db(body, 1_000.0, skipped_out + 200);
+            assert!(snr > 60.0, "{rate} Hz: SNR {snr:.1} dB an hour in");
+        }
+    }
+
+    #[test]
+    fn resample_keeps_speech_band_and_removes_what_would_alias() {
+        // 3 kHz is speech and must pass; 11 kHz would fold onto 5 kHz.
+        let pass = resample_to_16k(&sine(3_000.0, 48_000, 0, 48_000), 48_000);
+        assert!(snr_db(&pass[400..pass.len() - 400], 3_000.0, 400) > 50.0);
+
+        let stop = resample_to_16k(&sine(11_000.0, 48_000, 0, 48_000), 48_000);
+        let rms = (stop[400..stop.len() - 400].iter().map(|s| s * s).sum::<f32>()
+            / (stop.len() - 800) as f32)
+            .sqrt();
+        // The input sine has RMS 0.354; anything left is aliasing.
+        assert!(rms < 0.354 * 0.01, "11 kHz leaked through at RMS {rms}");
+    }
+
+    #[test]
+    fn streaming_in_odd_chunks_matches_one_shot() {
+        let src = sine(700.0, 44_100, 0, 44_100);
+        let whole = resample_to_16k(&src, 44_100);
+        let mut r = Resampler::new(44_100);
+        let mut out = Vec::new();
+        for chunk in src.chunks(977) {
+            r.push(chunk, &mut out);
+        }
+        r.finish(&mut out);
+        assert_eq!(out.len(), whole.len());
+        assert!(out.iter().zip(&whole).all(|(a, b)| (a - b).abs() < 1e-6));
+    }
+
+    #[test]
+    fn silence_stays_exactly_silent() {
+        // `dead_air` looks for exact zeros after resampling.
+        let out = resample_to_16k(&vec![0.0; 48_000], 48_000);
+        assert!(out.iter().all(|s| *s == 0.0));
+    }
+
+    #[test]
+    fn load_wav_16k_mono_downmixes_and_resamples() {
+        let dir = std::env::temp_dir().join(format!("stt-md-wavload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stereo.wav");
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 48_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(&path, spec).unwrap();
+        for s in sine(440.0, 48_000, 0, 48_000) {
+            let v = (s * i16::MAX as f32) as i16;
+            w.write_sample(v).unwrap();
+            w.write_sample(v).unwrap();
+        }
+        w.finalize().unwrap();
+        let out = load_wav_16k_mono(&path).unwrap();
+        assert!((out.len() as i64 - 16_000).abs() <= 2, "len={}", out.len());
+        assert!(snr_db(&out[400..out.len() - 400], 440.0, 400) > 50.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn resample_identity_at_16k() {
         let s = vec![0.1, 0.2, 0.3];
@@ -158,6 +478,6 @@ mod tests {
     fn resample_preserves_constant_signal() {
         let s = vec![0.5f32; 44_100];
         let out = resample_to_16k(&s, 44_100);
-        assert!(out.iter().all(|v| (v - 0.5).abs() < 1e-6));
+        assert!(out.iter().all(|v| (v - 0.5).abs() < 1e-5));
     }
 }

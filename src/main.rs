@@ -574,8 +574,7 @@ fn build_tray(items: &[&dyn tray_icon::menu::IsMenuItem]) -> anyhow::Result<tray
 
 fn load_track_16k(wav_path: &std::path::Path) -> anyhow::Result<Vec<f32>> {
     let t0 = Instant::now();
-    let (mono, sr) = audio_utils::load_wav_mono_f32(wav_path)?;
-    let resampled = audio_utils::resample_to_16k(&mono, sr);
+    let resampled = audio_utils::load_wav_16k_mono(wav_path)?;
     println!(
         "[stt-md] loaded {:.1}s from {} in {}ms",
         resampled.len() as f32 / 16_000.0,
